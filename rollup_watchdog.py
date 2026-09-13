@@ -1,4 +1,4 @@
-# { "Depends": "py-genlayer:test" }
+# { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
 """
 RollupWatchdog — consensus-backed L2 health oracle.
 
@@ -62,7 +62,14 @@ class RollupWatchdog(gl.Contract):
     assessment_count: u256
 
     def __init__(self, chains_json: str):
-        chains = json.loads(chains_json)
+        try:
+            chains = json.loads(chains_json)
+        except Exception:
+            raise gl.UserError(
+                "chains_json must be a JSON list of chain configs, e.g. "
+                '[{"id": "arbitrum-one", "name": "Arbitrum One", '
+                '"etherscan_chain_id": 42161, "status_url": ""}]'
+            )
         if not isinstance(chains, list) or not chains:
             raise gl.UserError("chains_json must be a non-empty JSON list")
         seen = set()
