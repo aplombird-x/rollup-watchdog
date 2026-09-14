@@ -31,8 +31,10 @@ exactly what GenLayer exists for.
 3. The contract computes block age itself. An LLM then judges **only** the
    status and writes the summary — it is never asked for numbers.
 4. `gl.eq_principle.prompt_comparative` drives consensus: `status` and
-   `block_age_bucket` must match across validators; summaries must describe
-   the same key facts; second-level timing differences are tolerated.
+   `block_age_bucket` must match across validators, the sampled numbers
+   (`block_number`, `block_age_seconds`, `assessed_at_unix`) are explicitly
+   excluded from comparison, and summaries must reach the same qualitative
+   conclusion.
 5. The consensus verdict is stored on-chain and readable via
    `get_assessment(chain_id)`.
 
@@ -86,7 +88,9 @@ oracle whose entire premise is trust-minimization. Mitigations: only
 escaped), they're fenced and labelled as untrusted data in the prompt, and a
 measured block age above 30 minutes structurally blocks a `HEALTHY` verdict no
 matter what that text claims. The status page can downgrade a verdict; it
-cannot upgrade one.
+cannot upgrade one. And a status page that cannot be read is reported to the
+model as *missing*, never as a bad reading — an absent signal must not become
+evidence of a problem.
 
 **"I can't tell" is a valid answer.** If the L2's latest block can't be read,
 the contract stores `INDETERMINATE` rather than guessing or reverting. Every
@@ -141,9 +145,10 @@ No API key: the data sources are keyless by design (see *Why Blockscout* above).
 [
   {"id": "arbitrum-one", "name": "Arbitrum One",
    "blockscout_url": "https://arbitrum.blockscout.com",
-   "status_url": "https://status.arbitrum.io/api/v2/status.json"},
+   "status_url": ""},
   {"id": "base", "name": "Base",
-   "blockscout_url": "https://base.blockscout.com", "status_url": ""},
+   "blockscout_url": "https://base.blockscout.com",
+   "status_url": "https://status.base.org/api/v2/status.json"},
   {"id": "zksync-era", "name": "ZKsync Era",
    "blockscout_url": "https://zksync.blockscout.com", "status_url": ""}
 ]
@@ -152,13 +157,20 @@ No API key: the data sources are keyless by design (see *Why Blockscout* above).
 Rules enforced at deploy time: `id`/`name` non-empty strings, unique `id`,
 `blockscout_url` an `https://` URL containing no `?`, `&` or spaces (which
 would let a config value rewrite the request), and `status_url` either `""` or
-an `https://` URL. Verify each URL returns JSON (HTTP 200) in a browser first.
+an `https://` URL.
+
+Verify each URL in a browser first. Most L2 status pages are Atlassian-hosted,
+so `<host>/api/v2/status.json` is the usual shape, but it is not universal:
+`status.base.org` serves it, `status.arbitrum.io` returns 404. A chain with
+`status_url: ""` is assessed on block freshness alone, which is a supported
+configuration, not a degraded one.
 
 Deployed on **Bradbury testnet** (chain ID 4221):
-- Contract: `0x4A67cb44b6b44041C6F0899173A3632FcC159085`
+- Contract: `0x4c780074870f2cDE322343FEDc0feAb166338923`
 - Owner (deployer; the only account that can call `add_chain`):
   `0x4e2eb6e59d37b792AeAc7F0682b3Ff8fcbAc21Be`
-- Configured chains: Arbitrum One, Base, ZKsync Era (all with `status_url: ""`)
+- Configured chains: Base (block freshness + status page), Arbitrum One and
+  ZKsync Era (block freshness only)
 
 ## Repo layout
 
@@ -168,9 +180,9 @@ rollup_watchdog.py         # the Intelligent Contract (single file, GenVM)
 test_rollup_watchdog.py    # off-chain tests (stubbed SDK, no dependencies)
 ```
 
-## SDK notes (from a Bradbury Studio run)
+## Field notes from deploying
 
-Three things the docs didn't tell us, every one found by deploying:
+Three GenVM behaviours the docs don't mention, each found the hard way:
 
 - **`gl.nondet.web.get()` returns a `Response` object, not a string.** Passing
   it to `json.loads()` raises `TypeError: not Response`. `_response_text()`
@@ -179,18 +191,51 @@ Three things the docs didn't tell us, every one found by deploying:
 - **`gl.UserError` does not exist in this build.** Worse than a missing name:
   it raised `AttributeError` *while handling* the real error, so the Studio
   traceback blamed the error type instead of the actual cause. `_fail()` now
-  resolves whatever the build exposes (`Rollback` / `rollback_immediate` / …).
-  Don't hardcode SDK error names in an error path.
+  resolves whatever the build exposes and falls back to a locally defined
+  `ContractFailure` — which is what Bradbury actually uses, since it has none
+  of `UserError`, `Rollback` or `rollback_immediate`. Never hardcode an SDK
+  error name in an error path.
 - **`exec_prompt(..., response_format="json")` returns a parsed dict**, not a
   JSON string — `json.loads()` on it raises *"must be str, bytes or bytearray,
   not dict"*. `_parse_model_reply()` accepts dict, str, or bytes.
-**Confirmed working on-chain**, Bradbury: block fetches, status-page fetch,
-`exec_prompt`, verdict assembly, and — after the move to Blockscout —
-`eq_principle.prompt_comparative` reaching consensus on a successful verdict
-(ACCEPTED on the first leader rotation, all executing validators Agree).
 
-Still unverified: the view methods (`get_assessment`, and `u256` as a return
-type on `get_assessment_count`).
+And two design lessons, each caught only by reading a live verdict:
+
+**Equivalence criteria must match how fast the data actually moves.** The first
+version promised that `block_number` would differ by only "a few blocks" and
+timestamps by "under a minute". Arbitrum produces ~4 blocks per second and
+consensus rounds can start ~90s apart, so on a run where *every validator
+succeeded* all three correctly voted Disagree. The criteria now compares only
+`status` and `block_age_bucket` and excludes the sampled numbers outright.
+
+**A missing signal must not look like a bad reading.** When the status page
+could not be read, the prompt used to receive the placeholder
+`{"indicator": "UNAVAILABLE", "description": ""}`. That sits in the same
+vocabulary as statuspage.io's real indicators (`none`, `minor`, `major`), so
+the model treated it as the chain reporting trouble and returned `DEGRADED`
+for a rollup that had produced a block 0 seconds earlier. Absence of evidence
+was being converted into evidence of absence. The prompt now states plainly
+that the signal is unavailable, that this is not evidence of a problem, and
+the rules add that a missing status page is never by itself grounds for
+`DEGRADED`.
+
+## Verification status
+
+Every SDK question this contract depends on has been answered against the live
+chain. Confirmed on Bradbury:
+
+- Block fetches, status-page fetch, `exec_prompt`, and verdict assembly.
+- `eq_principle.prompt_comparative` reaching consensus on a successful
+  verdict — `ACCEPTED` on the first round, `rotation_count: 0`.
+- All three view methods, including `u256` as a view return type.
+- Missing-signal handling: a chain with no reachable status page returns
+  `HEALTHY` with the summary *"The official status page was unavailable, so
+  this assessment is based on block timing alone"* — the same chain the earlier
+  placeholder had downgraded to `DEGRADED`.
+
+A minority validator may still vote Disagree; one of two `gpt-5-4` validators
+did, on an otherwise unanimous verdict. That is ordinary model variance on a
+prose comparison, and quorum absorbs it.
 
 ## Tests
 
@@ -209,15 +254,14 @@ chain can't be reported HEALTHY, and that only two short fields of the status
 page ever reach the prompt.
 
 `_civil_to_unix()` (needed because GenVM's stdlib subset may lack `datetime`)
-is checked against `calendar.timegm` over 2,000 generated dates plus leap-year
+is checked against `calendar.timegm` over 20,000 generated dates plus leap-year
 and century edge cases.
 
-The stub mirrors the real SDK behavior observed in Studio — `web.get()` returns
-a Response object, `exec_prompt()` returns a parsed dict, and `gl.UserError`
-doesn't exist — so all three of those failures are now regression-locked.
-
-It does **not** cover GenVM semantics: consensus, storage, or nondet isolation.
-Deploy to GenLayer Studio for those.
+The stub mirrors the SDK behaviour observed in Studio — `web.get()` returns a
+Response object, `exec_prompt()` returns a parsed dict, `gl.UserError` does not
+exist — so all three of those failures are regression-locked. What the suite
+does **not** cover is GenVM semantics: consensus, storage, and nondet
+isolation. Deploy to GenLayer Studio for those.
 
 ## Differentiation
 
@@ -241,6 +285,10 @@ that generic infra monitoring doesn't cover.
 - **Only `status.indicator` and `status.description` are read** from the status
   page. That deliberately discards richer per-component data (e.g. "Sequencer:
   major outage") as the price of a narrow injection surface.
+- **Validators that disagree about whether the status page is reachable can
+  reach different verdicts.** The prompt now tells the model to ignore a
+  missing status page, which narrows this, but a page that is up for some
+  validators and down for others remains a source of minority disagreement.
 
 ## Roadmap (post-hackathon)
 
