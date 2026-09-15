@@ -101,36 +101,20 @@
 // ---------------------------------------------------------------------------
 const CONFIG = {
   contract: "0x3D62e1a41552Fc38BB6c7DAC95DF94D082163F45",
-  // Each Studio instance has its own chain id: dev 61997, staging 61998,
-  // production 61999. genlayer-js bundles `studionet` = production, so it
-  // cannot reach a dev deployment — hence the custom chain below. Confirmed
-  // by eth_chainId on this endpoint returning 0xf22d (61997).
-  // The endpoint sends `access-control-allow-origin: *`, which is why this
-  // page can call it straight from GitHub Pages, and rate-limits at 30
-  // requests/minute — ample for one reader.
+  // Each Studio instance has its own chain id (dev 61997, staging 61998,
+  // production 61999) and genlayer-js bundles only production, so the chain is
+  // defined locally. The endpoint allows cross-origin requests, which is what
+  // lets GitHub Pages call it directly.
   rpcUrl: "https://studio-dev.genlayer.com/api",
   chainId: 61997,
-  // npm dist-tags: latest=1.1.8 (2026-05-06), rc=2.0.0-rc.1 (2026-09-03).
-  // Studio's fee enforcement (enforce_v06_submission_config) shipped in the
-  // same window as the 2.0 RC, and 1.1.8 sends writes the consensus contract
-  // now rejects. Pinned rather than floating so a CDN change cannot silently
-  // swap the SDK under us; set to "1.1.8" to go back.
+  // Pinned: npm "latest" is 1.1.8, which predates Studio's fee enforcement and
+  // sends writes the consensus contract rejects.
   sdkVersion: "2.0.0-rc.1",
-  // The consensus contract rejects a zero fee (FeeValueMustBeNonZero). Studio's
-  // sim_estimateTransactionFees returned 155,454,600,002,588 wei for this
-  // contract — it is expensive to run (three fetches plus an LLM call), so the
-  // default budget is not enough. This is ~3x that, well under the 10 GEN the
-  // faucet grants; unspent budget is refunded.
-  feeValueWei: 500000000000000n,
   explorer: "https://explorer-studio-dev.genlayer.com",
 };
 
-// genlayer-js is loaded from a CDN so this page is a single static file with no
-// build step — which is what lets GitHub Pages serve it directly.
-// VERIFY against the version you load: the client factory, the read/write call
-// shapes, and whether waitForTransactionReceipt accepts status as the string
-// "FINALIZED" or wants an enum member. Errors are surfaced verbatim rather
-// than swallowed, so a mismatch names itself.
+// Loaded from a CDN so this stays a single static file with no build step.
+// Errors are surfaced verbatim rather than swallowed.
 const log = document.getElementById("log");
 const say = (msg, isError = false) => {
   log.textContent = msg;
@@ -138,7 +122,7 @@ const say = (msg, isError = false) => {
   if (isError) console.error(msg);
 };
 
-let client, account, chainsById = {};
+let client, account, sdkIsSuccessful, chainsById = {};
 
 const el = {
   chain: document.getElementById("chain"),
@@ -153,25 +137,20 @@ document.getElementById("explorer").href = `${CONFIG.explorer}/address/${CONFIG.
 // genlayer-js bundles `studionet` (production, id 61999) but nothing for the
 // dev instance, so the chain is defined here instead of looked up.
 function studioNextChain(sdk, chains) {
-  // Start from the production Studio export so SDK-specific fields (native
-  // currency, formatters) carry over, then override what is instance-specific.
+  // Start from the production export so SDK-specific fields carry over, then
+  // override everything instance-specific.
   const template = chains.studionet ?? Object.values(chains).find(Boolean) ?? {};
   const definition = {
     ...template,
     id: CONFIG.chainId,
     name: "GenLayer Studio Next",
     rpcUrls: { default: { http: [CONFIG.rpcUrl] }, public: { http: [CONFIG.rpcUrl] } },
-    // Inherited from the production template and would point at the wrong
-    // instance: drop it rather than display something false.
-    blockExplorers: undefined,
+    blockExplorers: undefined,   // inherited; would point at the wrong instance
   };
-  // genlayer-js re-exports viem's defineChain; prefer it so the object is
-  // validated the way the SDK expects instead of hand-rolled.
   return typeof sdk.defineChain === "function" ? sdk.defineChain(definition) : definition;
 }
 
-// sim_fundAccount and eth_getBalance are node methods, not contract calls, so
-// they go over plain JSON-RPC rather than through the SDK client.
+// Node methods, not contract calls, so they bypass the SDK client.
 async function rpc(method, params) {
   const response = await fetch(CONFIG.rpcUrl, {
     method: "POST",
@@ -207,9 +186,8 @@ async function refreshBalance() {
   }
 }
 
-// The dev faucet Studio's own Fund button uses. The amount is wei as a string:
-// passing a bare 10 would send ten wei, which looks like success but cannot
-// cover a fee.
+// The faucet Studio's own Fund button calls. Amount is wei as a string — a
+// bare 10 would send ten wei and look like success.
 const FUND_AMOUNT_WEI = "10000000000000000000";
 
 async function fundAccount() {
@@ -227,10 +205,8 @@ async function fundAccount() {
   }
 }
 
-// assess() is a write and Studio Next charges a fee, so the caller needs GEN.
-// A throwaway account generated per page load would be unfundable: its address
-// changes on every reload. So the key is generated once, kept in localStorage,
-// and its address shown — that makes it fundable from the Studio faucet.
+// Writes cost GEN, so the caller needs a funded account. The key is generated
+// once and kept in localStorage, so the address is stable and fundable.
 const STORAGE_KEY = "rollup-watchdog.pk";
 
 function newPrivateKey() {
@@ -239,12 +215,9 @@ function newPrivateKey() {
 }
 
 function buildAccount(sdk, privateKey) {
-  // VERIFY: the factory that accepts a key is spelled differently across SDK
-  // versions. Two failure modes matter, and only one of them throws:
-  //   - it rejects the key  -> caught below, try the next name
-  //   - it IGNORES the key and returns a random account -> no throw, but the
-  //     address changes on every reload, so funding it is pointless
-  // Building twice and comparing addresses catches the silent case.
+  // A factory that silently ignores the key returns a fresh random account
+  // each call, leaving the address unfundable. Building twice and comparing
+  // catches that; a rejected key just throws.
   for (const name of ["createAccount", "privateKeyToAccount", "accountFromPrivateKey"]) {
     if (typeof sdk[name] !== "function") continue;
     try {
@@ -266,6 +239,7 @@ async function connect() {
     import(base),
     import(`${base}/chains`),
   ]);
+  sdkIsSuccessful = sdk.isSuccessful;
   const key = localStorage.getItem(STORAGE_KEY) || newPrivateKey();
   const built = buildAccount(sdk, key);
   if (built) {
@@ -364,23 +338,37 @@ async function readVerdict(chainId) {
 async function runAssessment(chainId) {
   el.run.disabled = el.refresh.disabled = true;
   try {
-    say(`Submitting assess("${chainId}")… validators will each fetch the signals independently.`);
-    const hash = await client.writeContract({
+    const write = {
       address: CONFIG.contract,
       functionName: "assess",
       args: [chainId],
-      // assess() is not payable, so none of this reaches the contract: the
-      // value rides on the EVM transaction to the consensus contract and pays
-      // the validators' execution budget.
-      value: CONFIG.feeValueWei,
+    };
+    // Estimating per click is the documented development pattern; production
+    // apps ship a checked-in fee profile instead.
+    say("Estimating the execution budget…");
+    const estimate = await client.estimateTransactionFeesForWrite(write);
+    console.info("fee estimate", estimate);
+
+    say(`Submitting assess("${chainId}")… each validator fetches the signals independently.`);
+    // `value` is for payable methods only; the fee is a separate deposit.
+    const hash = await client.writeContract({
+      ...write,
+      fees: { distribution: estimate.distribution, feeValue: estimate.feeValue },
     });
+
     say(`Transaction ${hash} submitted. Waiting for consensus…`);
-    await client.waitForTransactionReceipt({ hash, status: "FINALIZED" });
+    const receipt = await client.waitForFinalization({ hash });
+    // Reaching finalized does not prove the execution succeeded, so ask.
+    if (sdkIsSuccessful && !sdkIsSuccessful(receipt)) {
+      throw new Error(
+        `${receipt?.statusName ?? "finalized"} / ` +
+        `${receipt?.txExecutionResultName ?? "unknown execution result"}`
+      );
+    }
     say(`Consensus reached. Transaction ${hash}`);
     await readVerdict(chainId);
   } catch (error) {
-    // The two expected failures are an unfunded account and the 60s per-chain
-    // throttle; both are legitimate, so name them rather than just echoing.
+    // An unfunded account and the 60s throttle are both expected; name them.
     const detail = String(error?.message ?? error);
     const hint = /fund|balance|insufficient/i.test(detail)
       ? " — fund the session address above from the Studio Next faucet."
