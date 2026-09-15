@@ -100,7 +100,7 @@
 // CONFIG — your Studio Next deployment.
 // ---------------------------------------------------------------------------
 const CONFIG = {
-  contract: "0x3D62e1a41552Fc38BB6c7DAC95DF94D082163F45",
+  contract: "0x9bB01d8B136527698f6196a28aD657e8800E22B7",
   // Each Studio instance has its own chain id (dev 61997, staging 61998,
   // production 61999) and genlayer-js bundles only production, so the chain is
   // defined locally. The endpoint allows cross-origin requests, which is what
@@ -306,7 +306,12 @@ function render(json) {
   el.verdict.querySelector(".status").textContent = v.status;
   el.verdict.querySelector(".summary").textContent = v.summary;
 
-  const ageSeconds = Math.max(0, Math.floor(Date.now() / 1000) - v.assessed_at_unix);
+  // Date.now() is epoch-based, so this is right in every timezone -- but it
+  // trusts the device clock. A verdict dated in the future means that clock is
+  // behind; say so rather than clamp it to 0 and imply the verdict is fresh.
+  const skew = v.assessed_at_unix - Math.floor(Date.now() / 1000);
+  const ageSeconds = Math.max(0, -skew);
+  const clockOff = skew > 120;
   const stale = ageSeconds > 600;
   const fact = (label, value, cls = "") =>
     `<div class="fact"><b>${label}</b><span class="${cls}">${value}</span></div>`;
@@ -317,7 +322,11 @@ function render(json) {
     fact("Age bucket", v.block_age_bucket),
     // Staleness is the number a consumer must not ignore: a HEALTHY verdict
     // from an hour ago says nothing about the chain right now.
-    fact("Verdict age", `${ageSeconds}s ago`, stale ? "stale" : ""),
+    fact(
+      "Verdict age",
+      clockOff ? "device clock is behind" : `${ageSeconds}s ago`,
+      clockOff || stale ? "stale" : "",
+    ),
   ].join("");
 }
 
@@ -356,15 +365,15 @@ async function runAssessment(chainId) {
       fees: { distribution: estimate.distribution, feeValue: estimate.feeValue },
     });
 
-    say(`Transaction ${hash} submitted. Waiting for consensus (up to ~1 min)…`);
+    say(`Transaction ${hash} submitted. Waiting for consensus — this can take a few minutes…`);
     // waitForDecision, not waitForFinalization: the verdict is stored once the
     // decision materialises. Finalization additionally waits for fee
     // settlement and refunds, which this page does not need.
     //
     // Poll explicitly rather than relying on SDK defaults: an assessment runs
-    // five validators, each making three fetches and an LLM call, so it takes
-    // ~30-60s. The documented Python default (3s x 10 = 30s) would often
-    // expire first. 3s x 100 gives five minutes.
+    // five validators, each making up to four fetches and an LLM call. The
+    // documented Python default (3s x 10 = 30s) would often expire first;
+    // 3s x 100 gives five minutes.
     const receipt = await client.waitForDecision({
       hash, interval: 3_000, retries: 100,
     });
