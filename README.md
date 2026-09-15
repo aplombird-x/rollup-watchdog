@@ -155,6 +155,11 @@ from a CDN, so there is no build step and no `node_modules`.
 deployment — change it only if you deploy your own. Serve locally with
 `python3 -m http.server`, or publish via **Settings → Pages → main / root**.
 
+Reading verdicts is free. **Running an assessment is a write and costs GEN**,
+so the page generates a session account, keeps its key in `localStorage` (the
+address is therefore stable across reloads) and displays it to be funded from
+the Studio Next faucet. You can paste an already-funded key instead.
+
 The chain list comes from `list_chains()` rather than being hardcoded, so the
 page reflects the actual deployment and labels each chain one-signal or two.
 The verdict panel shows the traffic light, the AI-written reason, the measured
@@ -249,8 +254,11 @@ Two lessons came from reading live verdicts rather than from tests:
 
 ## Known limitations
 
-- **Blockscout is a single data source.** Keyless and per-IP, so it scales with
-  validators, but an outage makes verdicts `INDETERMINATE`.
+- **Blockscout is a single data source, and its two roles fail differently.**
+  If a chain's own Blockscout is unreachable the verdict is `INDETERMINATE` and
+  is stored. If the clock (`eth.blockscout.com`) is unreachable the call fails
+  outright and nothing is stored — without a trusted clock there is no honest
+  verdict to write.
 - **Timestamps are assumed UTC.** An instance returning a non-UTC offset would
   be mis-read by that offset.
 - **Block age is only accurate to ~12s**, the mainnet block time. An L2 block
