@@ -109,20 +109,24 @@
 // ---------------------------------------------------------------------------
 const CONFIG = {
   contract: "0x3D62e1a41552Fc38BB6c7DAC95DF94D082163F45",
-  // genlayer-js identifies chains by export name. Which export backs the
-  // Studio Next deployment is not documented and guessing it wasted two
-  // rounds, so the page probes these in order and keeps the first one that
-  // actually has the contract. Put the winner first once it is known.
-  chainExports: ["testnetAsimov", "studionet", "testnetBradbury", "localnet"],
+  // Each Studio instance has its own chain id: dev 61997, staging 61998,
+  // production 61999. genlayer-js bundles `studionet` = production, so it
+  // cannot reach a dev deployment — hence the custom chain below. Confirmed
+  // by eth_chainId on this endpoint returning 0xf22d (61997).
+  // The endpoint sends `access-control-allow-origin: *`, which is why this
+  // page can call it straight from GitHub Pages, and rate-limits at 30
+  // requests/minute — ample for one reader.
+  rpcUrl: "https://studio-dev.genlayer.com/api",
+  chainId: 61997,
   explorer: "https://explorer-studio-dev.genlayer.com",
 };
 
 // genlayer-js is loaded from a CDN so this page is a single static file with no
 // build step — which is what lets GitHub Pages serve it directly.
 // VERIFY against the version you load: the client factory, the read/write call
-// shapes, the chain export name, and whether waitForTransactionReceipt accepts
-// status as the string "FINALIZED" or wants an enum member. Errors below are
-// surfaced verbatim rather than swallowed, so a mismatch names itself.
+// shapes, and whether waitForTransactionReceipt accepts status as the string
+// "FINALIZED" or wants an enum member. Errors are surfaced verbatim rather
+// than swallowed, so a mismatch names itself.
 const log = document.getElementById("log");
 const say = (msg, isError = false) => {
   log.textContent = msg;
@@ -142,33 +146,24 @@ const el = {
 document.getElementById("addr").textContent = CONFIG.contract;
 document.getElementById("explorer").href = `${CONFIG.explorer}/address/${CONFIG.contract}`;
 
-// Probe each candidate network for the contract rather than assuming one.
-// A chain is "right" only if list_chains() actually answers on it, which is a
-// far stronger check than matching a name or an id.
-async function discoverChain(sdk, chains, account) {
-  const candidates = CONFIG.chainExports.filter((name) => chains[name]);
-  const unknown = CONFIG.chainExports.filter((name) => !chains[name]);
-  if (unknown.length) console.warn("not exported by genlayer-js/chains:", unknown);
-
-  const failures = [];
-  for (const name of candidates) {
-    const chain = chains[name];
-    say(`Looking for the contract on ${name} (id ${chain.id})…`);
-    try {
-      const probe = sdk.createClient(account ? { chain, account } : { chain });
-      await probe.readContract({
-        address: CONFIG.contract, functionName: "list_chains", args: [],
-      });
-      console.info(`contract found on ${name} (id ${chain.id})`);
-      return { chain, client: probe, name };
-    } catch (error) {
-      failures.push(`${name} (id ${chain.id}): ${error?.shortMessage ?? error?.message ?? error}`);
-    }
-  }
-  throw new Error(
-    `Contract ${CONFIG.contract} was not found on any known network.\n` +
-    failures.join("\n")
-  );
+// genlayer-js bundles `studionet` (production, id 61999) but nothing for the
+// dev instance, so the chain is defined here instead of looked up.
+function studioNextChain(sdk, chains) {
+  // Start from the production Studio export so SDK-specific fields (native
+  // currency, formatters) carry over, then override what is instance-specific.
+  const template = chains.studionet ?? Object.values(chains).find(Boolean) ?? {};
+  const definition = {
+    ...template,
+    id: CONFIG.chainId,
+    name: "GenLayer Studio Next",
+    rpcUrls: { default: { http: [CONFIG.rpcUrl] }, public: { http: [CONFIG.rpcUrl] } },
+    // Inherited from the production template and would point at the wrong
+    // instance: drop it rather than display something false.
+    blockExplorers: undefined,
+  };
+  // genlayer-js re-exports viem's defineChain; prefer it so the object is
+  // validated the way the SDK expects instead of hand-rolled.
+  return typeof sdk.defineChain === "function" ? sdk.defineChain(definition) : definition;
 }
 
 // assess() is a write and Studio Next charges a fee, so the caller needs GEN.
@@ -214,14 +209,16 @@ async function connect(privateKey) {
   // a bad paste would strand an account the user had already funded.
   if (built) localStorage.setItem(STORAGE_KEY, key);
   account = built;
-  // Paint the account before touching the network: if discovery fails the
+  // Paint the account before touching the network: if the connection fails the
   // user should still see (and be able to fund) their address.
   showAccount();
   // Without a usable account the page still reads verdicts; only writes need
   // one, so degrade rather than failing the whole page.
-  const found = await discoverChain(sdk, chains, account);
-  client = found.client;
-  say(`Connected to ${found.name}.`);
+  const chain = studioNextChain(sdk, chains);
+  client = sdk.createClient(account ? { chain, account } : { chain });
+  say(`Connected to ${CONFIG.rpcUrl} (chain ${CONFIG.chainId}).`);
+  // No verification read here: loadChains() runs next and fails just as
+  // clearly, and duplicating it would double every page load's RPC cost.
   return Boolean(account);
 }
 
