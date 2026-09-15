@@ -45,6 +45,16 @@
   .fact b { display: block; font-size: 11px; letter-spacing: .06em; text-transform: uppercase;
             color: var(--muted); font-weight: 600; margin-bottom: 3px; }
   .stale { color: var(--degraded); }
+  .wallet { border-top: 1px solid var(--line); margin-top: 16px; padding-top: 14px; }
+  .wallet code { font-size: 12.5px; word-break: break-all; color: var(--ink); }
+  .wallet .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .hint { color: var(--muted); font-size: 12.5px; margin: 8px 0 0; }
+  .hint.warn { color: var(--degraded); }
+  details { margin-top: 10px; }
+  summary { color: var(--accent); cursor: pointer; font-size: 12.5px; }
+  details input { width: 100%; margin-top: 8px; font: inherit; padding: 9px 11px;
+                  border-radius: 8px; border: 1px solid var(--line);
+                  background: #0a1a26; color: var(--ink); }
   #log { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px;
          color: var(--muted); white-space: pre-wrap; word-break: break-word; margin: 14px 0 0; }
   .err { color: var(--halted); }
@@ -64,6 +74,20 @@
     <button id="run" class="primary" disabled>Run assessment</button>
     <button id="refresh" disabled>Read latest verdict</button>
     <p id="log">Connecting…</p>
+
+    <div class="wallet">
+      <label>Session account</label>
+      <div class="row">
+        <code id="account">…</code>
+        <button id="copy">Copy</button>
+      </div>
+      <p class="hint" id="fund"></p>
+      <details>
+        <summary>Use an already-funded key instead</summary>
+        <input id="pk" placeholder="0x… private key (kept in this browser only)" />
+        <button id="usepk" style="margin-top:8px">Use this key</button>
+      </details>
+    </div>
   </div>
 
   <div class="panel" id="verdict" hidden>
@@ -92,8 +116,9 @@ const CONFIG = {
 // genlayer-js is loaded from a CDN so this page is a single static file with no
 // build step — which is what lets GitHub Pages serve it directly.
 // VERIFY against the version you load: the client factory, the read/write call
-// shapes, and the chain export name. Errors below are surfaced verbatim rather
-// than swallowed, so a mismatch names itself instead of failing silently.
+// shapes, the chain export name, and whether waitForTransactionReceipt accepts
+// status as the string "FINALIZED" or wants an enum member. Errors below are
+// surfaced verbatim rather than swallowed, so a mismatch names itself.
 const log = document.getElementById("log");
 const say = (msg, isError = false) => {
   log.textContent = msg;
@@ -101,7 +126,7 @@ const say = (msg, isError = false) => {
   if (isError) console.error(msg);
 };
 
-let client, chainsById = {};
+let client, account, chainsById = {};
 
 const el = {
   chain: document.getElementById("chain"),
@@ -125,14 +150,73 @@ function resolveChain(chains) {
   );
 }
 
-async function connect() {
-  const [{ createClient, createAccount }, chains] = await Promise.all([
+// assess() is a write and Studio Next charges a fee, so the caller needs GEN.
+// A throwaway account generated per page load would be unfundable: its address
+// changes on every reload. So the key is generated once, kept in localStorage,
+// and its address shown — that makes it fundable from the Studio faucet.
+const STORAGE_KEY = "rollup-watchdog.pk";
+
+function newPrivateKey() {
+  const bytes = crypto.getRandomValues(new Uint8Array(32));
+  return "0x" + [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function buildAccount(sdk, privateKey) {
+  // VERIFY: the factory that accepts a key is spelled differently across SDK
+  // versions. Two failure modes matter, and only one of them throws:
+  //   - it rejects the key  -> caught below, try the next name
+  //   - it IGNORES the key and returns a random account -> no throw, but the
+  //     address changes on every reload, so funding it is pointless
+  // Building twice and comparing addresses catches the silent case.
+  for (const name of ["createAccount", "privateKeyToAccount", "accountFromPrivateKey"]) {
+    if (typeof sdk[name] !== "function") continue;
+    try {
+      const first = sdk[name](privateKey);
+      const second = sdk[name](privateKey);
+      if (first?.address && first.address === second?.address) return first;
+      console.warn(`${name}() ignored the private key (non-deterministic address)`);
+    } catch (error) {
+      console.warn(`${name}(privateKey) failed:`, error);
+    }
+  }
+  return null;
+}
+
+async function connect(privateKey) {
+  const [sdk, chains] = await Promise.all([
     import("https://esm.sh/genlayer-js"),
     import("https://esm.sh/genlayer-js/chains"),
   ]);
-  // A burner account is enough: assess() is permissionless and the verdict is
-  // stored by the contract, not by the caller.
-  client = createClient({ chain: resolveChain(chains), account: createAccount() });
+  const key = privateKey || localStorage.getItem(STORAGE_KEY) || newPrivateKey();
+  const built = buildAccount(sdk, key);
+  // Persist only after the key proves usable: overwriting the stored key with
+  // a bad paste would strand an account the user had already funded.
+  if (built) localStorage.setItem(STORAGE_KEY, key);
+  account = built;
+  // Without a usable account the page still reads verdicts; only writes need
+  // one, so degrade rather than failing the whole page.
+  client = sdk.createClient(
+    account ? { chain: resolveChain(chains), account } : { chain: resolveChain(chains) }
+  );
+  showAccount();
+  return Boolean(account);
+}
+
+function showAccount() {
+  const fund = document.getElementById("fund");
+  document.getElementById("account").textContent = account?.address ?? "unavailable";
+  if (!account) {
+    fund.className = "hint warn";
+    fund.textContent =
+      "No usable account, so assessments are disabled — reading verdicts still " +
+      "works. See the console for which genlayer-js factory was tried.";
+    return;
+  }
+  fund.className = "hint";
+  fund.innerHTML =
+    "Reading verdicts is free. <b>Running an assessment costs GEN</b>, so fund " +
+    "this address from the Studio Next faucet first. The key is kept in this " +
+    "browser, so the address stays the same across reloads — testnet only.";
 }
 
 async function loadChains() {
@@ -202,12 +286,37 @@ async function runAssessment(chainId) {
     say(`Consensus reached. Transaction ${hash}`);
     await readVerdict(chainId);
   } catch (error) {
-    // Includes the 60s per-chain throttle, which is a deliberate contract rule.
-    say(`Assessment failed: ${error?.message ?? error}`, true);
+    // The two expected failures are an unfunded account and the 60s per-chain
+    // throttle; both are legitimate, so name them rather than just echoing.
+    const detail = String(error?.message ?? error);
+    const hint = /fund|balance|insufficient/i.test(detail)
+      ? " — fund the session address above from the Studio Next faucet."
+      : /wait \d+s|was assessed/i.test(detail)
+      ? " — this chain was assessed under a minute ago; try another chain."
+      : "";
+    say(`Assessment failed: ${detail}${hint}`, true);
   } finally {
     el.run.disabled = el.refresh.disabled = false;
   }
 }
+
+document.getElementById("copy").addEventListener("click", () => {
+  navigator.clipboard?.writeText(account?.address ?? "");
+  say("Session address copied. Fund it, then run an assessment.");
+});
+
+document.getElementById("usepk").addEventListener("click", async () => {
+  const key = document.getElementById("pk").value.trim();
+  if (!key) return say("Paste a private key first.", true);
+  try {
+    const usable = await connect(key);
+    el.run.disabled = !usable;
+    await loadChains();
+    say(usable ? "Using the supplied key." : "That key was not usable.", !usable);
+  } catch (error) {
+    say(`Could not use that key: ${error?.message ?? error}`, true);
+  }
+});
 
 el.run.addEventListener("click", () => runAssessment(el.chain.value));
 el.refresh.addEventListener("click", () => readVerdict(el.chain.value).catch(
@@ -219,9 +328,11 @@ el.chain.addEventListener("change", () => readVerdict(el.chain.value).catch(() =
     if (CONFIG.contract.startsWith("0xPASTE")) {
       throw new Error("Set CONFIG.contract to your Studio Next deployment address.");
     }
-    await connect();
+    const usable = await connect();
     const configured = await loadChains();
-    el.run.disabled = el.refresh.disabled = false;
+    // Reads never need an account; only the write button depends on one.
+    el.refresh.disabled = false;
+    el.run.disabled = !usable;
     await readVerdict(configured[0].id);
   } catch (error) {
     say(`Could not connect: ${error?.message ?? error}`, true);
