@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>RollupWatchdog — consensus-backed L2 health oracle</title>
+<style>
+  :root {
+    --bg: #06121c; --panel: #0d1f2d; --line: #1d3a4f; --ink: #e6f1f8;
+    --muted: #8fa9bd; --accent: #52d6ff;
+    --healthy: #35d07f; --degraded: #f5a623; --halted: #ff5f5f; --unknown: #7d8ea0;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 32px 20px; background: var(--bg); color: var(--ink);
+    font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  main { max-width: 760px; margin: 0 auto; }
+  h1 { font-size: 26px; margin: 0 0 4px; letter-spacing: -0.02em; }
+  .sub { color: var(--muted); margin: 0 0 28px; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 12px; padding: 20px; margin-bottom: 16px;
+  }
+  label { display: block; font-size: 12px; letter-spacing: .08em;
+          text-transform: uppercase; color: var(--accent); margin-bottom: 8px; }
+  select, button {
+    font: inherit; border-radius: 8px; border: 1px solid var(--line);
+    background: #0a1a26; color: var(--ink); padding: 11px 14px;
+  }
+  select { width: 100%; margin-bottom: 14px; }
+  button { cursor: pointer; font-weight: 600; }
+  button.primary { background: var(--accent); color: #04121b; border-color: var(--accent); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  .verdict-head { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; }
+  .dot { width: 14px; height: 14px; border-radius: 50%; background: var(--unknown); }
+  .status { font-size: 22px; font-weight: 700; letter-spacing: .02em; }
+  .HEALTHY .dot { background: var(--healthy); } .HEALTHY .status { color: var(--healthy); }
+  .DEGRADED .dot { background: var(--degraded); } .DEGRADED .status { color: var(--degraded); }
+  .HALTED .dot { background: var(--halted); } .HALTED .status { color: var(--halted); }
+  .INDETERMINATE .dot { background: var(--unknown); } .INDETERMINATE .status { color: var(--unknown); }
+  .summary { margin: 0 0 14px; }
+  .facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+  .fact { background: #091825; border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+  .fact b { display: block; font-size: 11px; letter-spacing: .06em; text-transform: uppercase;
+            color: var(--muted); font-weight: 600; margin-bottom: 3px; }
+  .stale { color: var(--degraded); }
+  #log { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px;
+         color: var(--muted); white-space: pre-wrap; word-break: break-word; margin: 14px 0 0; }
+  .err { color: var(--halted); }
+  a { color: var(--accent); }
+  footer { color: var(--muted); font-size: 13px; margin-top: 24px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>RollupWatchdog</h1>
+  <p class="sub">A consensus-backed health verdict for L2 rollups, judged on-chain by
+     independent GenLayer validators.</p>
+
+  <div class="panel">
+    <label for="chain">Chain</label>
+    <select id="chain"><option>Loading configured chains…</option></select>
+    <button id="run" class="primary" disabled>Run assessment</button>
+    <button id="refresh" disabled>Read latest verdict</button>
+    <p id="log">Connecting…</p>
+  </div>
+
+  <div class="panel" id="verdict" hidden>
+    <div class="verdict-head"><span class="dot"></span><span class="status"></span></div>
+    <p class="summary"></p>
+    <div class="facts"></div>
+  </div>
+
+  <footer>
+    Contract <a id="explorer" href="#" target="_blank" rel="noreferrer"><span id="addr"></span></a>
+    on GenLayer Studio Next ·
+    <a href="https://github.com/aplombird-x/rollup-watchdog" target="_blank" rel="noreferrer">source</a>
+  </footer>
+</main>
+
+<script type="module">
+// ---------------------------------------------------------------------------
+// CONFIG — set the address of your Studio Next (chain 61997) deployment.
+// ---------------------------------------------------------------------------
+const CONFIG = {
+  contract: "0x3D62e1a41552Fc38BB6c7DAC95DF94D082163F45",
+  chainId: 61997,
+  explorer: "https://explorer-studio-dev.genlayer.com",
+};
+
+// genlayer-js is loaded from a CDN so this page is a single static file with no
+// build step — which is what lets GitHub Pages serve it directly.
+// VERIFY against the version you load: the client factory, the read/write call
+// shapes, and the chain export name. Errors below are surfaced verbatim rather
+// than swallowed, so a mismatch names itself instead of failing silently.
+const log = document.getElementById("log");
+const say = (msg, isError = false) => {
+  log.textContent = msg;
+  log.className = isError ? "err" : "";
+  if (isError) console.error(msg);
+};
+
+let client, chainsById = {};
+
+const el = {
+  chain: document.getElementById("chain"),
+  run: document.getElementById("run"),
+  refresh: document.getElementById("refresh"),
+  verdict: document.getElementById("verdict"),
+};
+
+document.getElementById("addr").textContent = CONFIG.contract;
+document.getElementById("explorer").href = `${CONFIG.explorer}/address/${CONFIG.contract}`;
+
+function resolveChain(chains) {
+  // Pick whichever export carries our chain id, so an SDK rename does not
+  // silently point the page at the wrong network.
+  for (const candidate of Object.values(chains)) {
+    if (candidate && Number(candidate.id) === CONFIG.chainId) return candidate;
+  }
+  throw new Error(
+    `genlayer-js/chains has no chain with id ${CONFIG.chainId}. ` +
+    `Available exports: ${Object.keys(chains).join(", ")}`
+  );
+}
+
+async function connect() {
+  const [{ createClient, createAccount }, chains] = await Promise.all([
+    import("https://esm.sh/genlayer-js"),
+    import("https://esm.sh/genlayer-js/chains"),
+  ]);
+  // A burner account is enough: assess() is permissionless and the verdict is
+  // stored by the contract, not by the caller.
+  client = createClient({ chain: resolveChain(chains), account: createAccount() });
+}
+
+async function loadChains() {
+  const raw = await client.readContract({
+    address: CONFIG.contract, functionName: "list_chains", args: [],
+  });
+  const configured = JSON.parse(raw);
+  chainsById = Object.fromEntries(configured.map((c) => [c.id, c]));
+  el.chain.innerHTML = configured
+    .map((c) => {
+      const signals = c.status_url ? "block freshness + status page" : "block freshness only";
+      return `<option value="${c.id}">${c.name} — ${signals}</option>`;
+    })
+    .join("");
+  return configured;
+}
+
+function render(json) {
+  if (!json) {
+    el.verdict.hidden = true;
+    return;
+  }
+  const v = JSON.parse(json);
+  el.verdict.hidden = false;
+  el.verdict.className = `panel ${v.status}`;
+  el.verdict.querySelector(".status").textContent = v.status;
+  el.verdict.querySelector(".summary").textContent = v.summary;
+
+  const ageSeconds = Math.max(0, Math.floor(Date.now() / 1000) - v.assessed_at_unix);
+  const stale = ageSeconds > 600;
+  const fact = (label, value, cls = "") =>
+    `<div class="fact"><b>${label}</b><span class="${cls}">${value}</span></div>`;
+
+  el.verdict.querySelector(".facts").innerHTML = [
+    fact("Latest block", v.block_number ?? "unknown"),
+    fact("Block age", v.block_age_seconds === null ? "unknown" : `${v.block_age_seconds}s`),
+    fact("Age bucket", v.block_age_bucket),
+    // Staleness is the number a consumer must not ignore: a HEALTHY verdict
+    // from an hour ago says nothing about the chain right now.
+    fact("Verdict age", `${ageSeconds}s ago`, stale ? "stale" : ""),
+  ].join("");
+}
+
+async function readVerdict(chainId) {
+  say(`Reading stored verdict for ${chainId}…`);
+  const stored = await client.readContract({
+    address: CONFIG.contract, functionName: "get_assessment", args: [chainId],
+  });
+  if (!stored) {
+    render(null);
+    say(`No verdict stored yet for ${chainId}. Run an assessment to create one.`);
+    return;
+  }
+  render(stored);
+  say(`Latest consensus verdict for ${chainsById[chainId]?.name ?? chainId}.`);
+}
+
+async function runAssessment(chainId) {
+  el.run.disabled = el.refresh.disabled = true;
+  try {
+    say(`Submitting assess("${chainId}")… validators will each fetch the signals independently.`);
+    const hash = await client.writeContract({
+      address: CONFIG.contract, functionName: "assess", args: [chainId], value: 0n,
+    });
+    say(`Transaction ${hash} submitted. Waiting for consensus…`);
+    await client.waitForTransactionReceipt({ hash, status: "FINALIZED" });
+    say(`Consensus reached. Transaction ${hash}`);
+    await readVerdict(chainId);
+  } catch (error) {
+    // Includes the 60s per-chain throttle, which is a deliberate contract rule.
+    say(`Assessment failed: ${error?.message ?? error}`, true);
+  } finally {
+    el.run.disabled = el.refresh.disabled = false;
+  }
+}
+
+el.run.addEventListener("click", () => runAssessment(el.chain.value));
+el.refresh.addEventListener("click", () => readVerdict(el.chain.value).catch(
+  (e) => say(`Read failed: ${e?.message ?? e}`, true)));
+el.chain.addEventListener("change", () => readVerdict(el.chain.value).catch(() => render(null)));
+
+(async function start() {
+  try {
+    if (CONFIG.contract.startsWith("0xPASTE")) {
+      throw new Error("Set CONFIG.contract to your Studio Next deployment address.");
+    }
+    await connect();
+    const configured = await loadChains();
+    el.run.disabled = el.refresh.disabled = false;
+    await readVerdict(configured[0].id);
+  } catch (error) {
+    say(`Could not connect: ${error?.message ?? error}`, true);
+  }
+})();
+</script>
+</body>
+</html>
