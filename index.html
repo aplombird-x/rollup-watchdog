@@ -109,10 +109,11 @@
 // ---------------------------------------------------------------------------
 const CONFIG = {
   contract: "0x3D62e1a41552Fc38BB6c7DAC95DF94D082163F45",
-  // genlayer-js identifies chains by export name, not by id: the module
-  // exports localnet, studionet, testnetAsimov, testnetBradbury. Match on the
-  // name and treat the id as a cross-check only.
-  chainExport: "studionet",
+  // genlayer-js identifies chains by export name. Which export backs the
+  // Studio Next deployment is not documented and guessing it wasted two
+  // rounds, so the page probes these in order and keeps the first one that
+  // actually has the contract. Put the winner first once it is known.
+  chainExports: ["testnetAsimov", "studionet", "testnetBradbury", "localnet"],
   explorer: "https://explorer-studio-dev.genlayer.com",
 };
 
@@ -141,21 +142,32 @@ const el = {
 document.getElementById("addr").textContent = CONFIG.contract;
 document.getElementById("explorer").href = `${CONFIG.explorer}/address/${CONFIG.contract}`;
 
-function resolveChain(chains) {
-  const chosen = chains[CONFIG.chainExport];
-  if (chosen) {
-    console.info(`chain ${CONFIG.chainExport} -> id ${chosen.id}`);
-    return chosen;
+// Probe each candidate network for the contract rather than assuming one.
+// A chain is "right" only if list_chains() actually answers on it, which is a
+// far stronger check than matching a name or an id.
+async function discoverChain(sdk, chains, account) {
+  const candidates = CONFIG.chainExports.filter((name) => chains[name]);
+  const unknown = CONFIG.chainExports.filter((name) => !chains[name]);
+  if (unknown.length) console.warn("not exported by genlayer-js/chains:", unknown);
+
+  const failures = [];
+  for (const name of candidates) {
+    const chain = chains[name];
+    say(`Looking for the contract on ${name} (id ${chain.id})…`);
+    try {
+      const probe = sdk.createClient(account ? { chain, account } : { chain });
+      await probe.readContract({
+        address: CONFIG.contract, functionName: "list_chains", args: [],
+      });
+      console.info(`contract found on ${name} (id ${chain.id})`);
+      return { chain, client: probe, name };
+    } catch (error) {
+      failures.push(`${name} (id ${chain.id}): ${error?.shortMessage ?? error?.message ?? error}`);
+    }
   }
-  // Report names WITH ids: listing names alone leaves the next person guessing
-  // which one to use, which is how this failed the first time.
-  const available = Object.entries(chains)
-    .filter(([, c]) => c && c.id !== undefined)
-    .map(([name, c]) => `${name} (id ${c.id})`)
-    .join(", ");
   throw new Error(
-    `genlayer-js/chains has no export named "${CONFIG.chainExport}". ` +
-    `Available: ${available || Object.keys(chains).join(", ")}`
+    `Contract ${CONFIG.contract} was not found on any known network.\n` +
+    failures.join("\n")
   );
 }
 
@@ -202,13 +214,14 @@ async function connect(privateKey) {
   // a bad paste would strand an account the user had already funded.
   if (built) localStorage.setItem(STORAGE_KEY, key);
   account = built;
-  // Paint the account before resolving the chain: if chain lookup fails the
+  // Paint the account before touching the network: if discovery fails the
   // user should still see (and be able to fund) their address.
   showAccount();
   // Without a usable account the page still reads verdicts; only writes need
   // one, so degrade rather than failing the whole page.
-  const chain = resolveChain(chains);
-  client = sdk.createClient(account ? { chain, account } : { chain });
+  const found = await discoverChain(sdk, chains, account);
+  client = found.client;
+  say(`Connected to ${found.name}.`);
   return Boolean(account);
 }
 
