@@ -116,6 +116,12 @@ const CONFIG = {
   // now rejects. Pinned rather than floating so a CDN change cannot silently
   // swap the SDK under us; set to "1.1.8" to go back.
   sdkVersion: "2.0.0-rc.1",
+  // The consensus contract rejects a zero fee (FeeValueMustBeNonZero). Studio's
+  // sim_estimateTransactionFees returned 155,454,600,002,588 wei for this
+  // contract — it is expensive to run (three fetches plus an LLM call), so the
+  // default budget is not enough. This is ~3x that, well under the 10 GEN the
+  // faucet grants; unspent budget is refunded.
+  feeValueWei: 500000000000000n,
   explorer: "https://explorer-studio-dev.genlayer.com",
 };
 
@@ -360,7 +366,13 @@ async function runAssessment(chainId) {
   try {
     say(`Submitting assess("${chainId}")… validators will each fetch the signals independently.`);
     const hash = await client.writeContract({
-      address: CONFIG.contract, functionName: "assess", args: [chainId], value: 0n,
+      address: CONFIG.contract,
+      functionName: "assess",
+      args: [chainId],
+      // assess() is not payable, so none of this reaches the contract: the
+      // value rides on the EVM transaction to the consensus contract and pays
+      // the validators' execution budget.
+      value: CONFIG.feeValueWei,
     });
     say(`Transaction ${hash} submitted. Waiting for consensus…`);
     await client.waitForTransactionReceipt({ hash, status: "FINALIZED" });
