@@ -1,60 +1,60 @@
-# { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
+# v0.3.0
+# { "Depends": "py-genlayer:5jycge4q8k23462jtb0b9fyey1s9qz928sz2nbrd9mg4sxqg2qng" }
 """
 RollupWatchdog — consensus-backed L2 health oracle.
 
-Anyone can trigger an assessment of a configured L2 rollup. Validators
-independently fetch live signals (latest-block freshness plus the chain's
-official status page), an LLM turns them into a judgment, and GenLayer's
-equivalence principle drives consensus on that judgment. The latest consensus
-verdict per chain is stored on-chain, so wallets, bridges and dashboards can
-consume it without trusting any single party.
+Anyone calls assess(chain_id). Validators independently fetch live signals,
+an LLM turns them into a judgment, and GenLayer's equivalence principle drives
+consensus on that judgment. The latest verdict per chain is stored on-chain.
 
-Statuses: HEALTHY | DEGRADED | HALTED | INDETERMINATE (stored as strings).
-INDETERMINATE means the liveness signal could not be read — the oracle says
-"I can't tell" rather than guessing or reverting.
+Statuses: HEALTHY | DEGRADED | HALTED | INDETERMINATE. INDETERMINATE means the
+liveness signal could not be read — the oracle says "I can't tell" rather than
+guessing or reverting.
 
-Every number in the stored verdict is measured by this contract. The model
-only chooses the status and writes the prose.
+Two invariants worth keeping:
+  - Every number in the verdict is measured here. The model chooses only the
+    status and writes the prose.
+  - A status page that is absent or unreadable is reported to the model as
+    missing, never as a bad reading. Absence of evidence is not evidence of a
+    problem.
 
 Data sources
-  - Latest block per chain: GET <blockscout_url>/api/v2/blocks?type=block.
-    Both the {"items": [...]} envelope and a bare [...] list are accepted, as
-    are "height" and "number" keys: Blockscout instances differ.
-  - Ethereum mainnet (eth.blockscout.com) acts as a trusted wall clock. Its
-    latest block timestamp is "now" to within ~12s, which is what makes block
-    age a measurement rather than an LLM guess.
-  - Blockscout timestamps are ISO-8601 UTC. GenVM's stdlib subset may lack
-    datetime, so _civil_to_unix() converts using plain arithmetic; the tests
-    check it against calendar.timegm over 20,000 dates.
-  - status_url entries are statuspage.io public APIs (/api/v2/status.json
-    needs no auth). "" disables that signal for a chain. A status page that is
-    absent or unreadable is reported to the model as missing, never as a bad
-    reading: absence of evidence must not become evidence of a problem.
+  - Latest block: GET <blockscout_url>/api/v2/blocks?type=block. Both the
+    {"items": [...]} envelope and a bare list are accepted, as are "height"
+    and "number" keys — Blockscout instances differ.
+  - Ethereum mainnet (eth.blockscout.com) is a trusted wall clock, accurate to
+    ~12s. That is what makes block age a measurement rather than a guess.
+  - Timestamps are ISO-8601 UTC. GenVM's stdlib subset may lack datetime, so
+    _civil_to_unix() uses plain arithmetic; the tests check it against
+    calendar.timegm over 20,000 dates.
+  - status_url entries are statuspage.io APIs; "" disables that signal.
 
-  Blockscout rather than Etherscan is a consensus requirement, not a
-  preference. Etherscan rate-limits per API key; every validator runs this
-  code at the same moment with the same key, so validator fan-out guarantees
-  throttling and the resulting failures break consensus. Blockscout is
-  keyless and limits per IP, giving each validator its own budget.
+  Blockscout rather than Etherscan is a consensus requirement: Etherscan
+  rate-limits per API key, so N validators sharing one key guarantee throttling
+  and the resulting failures break consensus. Blockscout limits per IP.
 
-GenVM specifics (verified on Bradbury)
+GenVM (Studio Next, v0.3.0)
+  The version header and exact Depends hash above are mandatory; ":latest" is
+  rejected on-network. Namespace: `import genlayer as gl` plus
+  `from genlayer.types import *`, `gl.contract.Contract`, and
+  `gl.storage.TreeMap` (no longer auto-imported). Stored integers must be
+  u256/i256, not native int.
+
   - gl.nondet.web.get() returns a Response object, not a string.
-    _response_text() unwraps it, and names the attributes it did find when
-    the shape is unfamiliar.
-  - gl.nondet.exec_prompt(..., response_format="json") returns an already
-    parsed dict, so json.loads() on it raises TypeError.
-    _parse_model_reply() accepts dict, str or bytes.
-  - Neither gl.UserError, Rollback nor gl.rollback_immediate exists on this
-    build, so _fail() raises a locally defined ContractFailure. Resolving the
-    type once at import avoids the trap where a wrong SDK name raises
-    AttributeError *while handling* a real error and hides its cause.
+  - gl.nondet.exec_prompt(..., response_format="json") returns a parsed dict,
+    so json.loads() on it raises TypeError.
+  - The user-facing error type moves between builds (gl.vm.UserError here,
+    absent on Bradbury), so _resolve_error_type() looks it up by dotted path.
+    Never raise a hardcoded SDK error name: a wrong one raises AttributeError
+    *while handling* a real error and hides its cause.
   - Never swallow an exception around an SDK call. Every except block below
     either reports the cause or guards a genuinely optional signal.
 """
 
 import json
 
-from genlayer import *
+import genlayer as gl
+from genlayer.types import *
 
 # Chains are configured at deploy time (constructor arg) so the contract is a
 # reusable oracle framework, not a hardcoded 3-chain demo. Example:
@@ -89,12 +89,27 @@ MODEL_ATTEMPTS = 2
 BLOCK_FETCH_ATTEMPTS = 3
 
 
+def _lookup(path: str):
+    """Resolve a dotted attribute path on gl, or None if any step is absent.
+
+    getattr() only absorbs AttributeError and gl.__getattr__ is build-specific,
+    so the guard is deliberately broad: this runs at import, and an exception
+    here stops the module loading at all — which Studio reports as an
+    unexplained schema error rather than a Python traceback.
+    """
+    node = gl
+    for part in path.split("."):
+        try:
+            node = getattr(node, part)
+        except Exception:
+            return None
+    return node
+
+
 def _resolve_error_type():
-    """The user-facing error type, whatever this GenVM build calls it."""
-    for name in ("Rollback", "UserError", "ContractError"):
-        candidate = globals().get(name, None)
-        if candidate is None:
-            candidate = getattr(gl, name, None)
+    """The user-facing error type, wherever this GenVM build keeps it."""
+    for path in ("vm.UserError", "UserError", "Rollback", "ContractError"):
+        candidate = _lookup(path)
         if isinstance(candidate, type) and issubclass(candidate, BaseException):
             return candidate
 
@@ -108,7 +123,7 @@ ERROR = _resolve_error_type()
 
 
 def _fail(message: str) -> None:
-    rollback = getattr(gl, "rollback_immediate", None)
+    rollback = _lookup("vm.rollback_immediate") or _lookup("rollback_immediate")
     if callable(rollback):
         rollback(message)
     raise ERROR(message)
@@ -246,7 +261,12 @@ def _read_block(raw: str) -> tuple:
     block = items[0]
     if not isinstance(block, dict):
         return None, None, "unexpected block entry"
-    number = block.get("height", block.get("number"))
+    # Not get("height", block.get("number")): a present-but-null "height" must
+    # still fall through to "number". Not `or` either, which would discard a
+    # legitimate height of 0.
+    number = block.get("height")
+    if number is None:
+        number = block.get("number")
     if isinstance(number, str):
         try:
             number = int(number, 0)
@@ -348,15 +368,15 @@ def _build_verdict(
     )
 
 
-class RollupWatchdog(gl.Contract):
+class RollupWatchdog(gl.contract.Contract):
     owner: Address
     # Canonical JSON list of chain configs, kept for list_chains().
     chains_json: str
     # chain_id -> canonical config JSON; keyed lookup, no full-list parse.
-    chains: TreeMap[str, str]
+    chains: gl.storage.TreeMap[str, str]
     # chain_id -> canonical JSON: {"status", "summary", "block_number",
     #             "block_age_seconds", "block_age_bucket", "assessed_at_unix"}
-    assessments: TreeMap[str, str]
+    assessments: gl.storage.TreeMap[str, str]
     assessment_count: u256
 
     def __init__(self, chains_json: str):
@@ -458,6 +478,9 @@ class RollupWatchdog(gl.Contract):
                     None,
                     now,
                 )
+            # The mainnet clock lags real time by up to one block (~12s), so a
+            # fast L2 can report a block newer than "now". Clamp rather than
+            # emit a negative age; ages under ~12s are not meaningful anyway.
             age_seconds = max(0, now - block_timestamp)
 
             # ---- Live signal 2: official status page (optional) ----
