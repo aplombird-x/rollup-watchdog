@@ -50,11 +50,6 @@
   .wallet .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
   .hint { color: var(--muted); font-size: 12.5px; margin: 8px 0 0; }
   .hint.warn { color: var(--degraded); }
-  details { margin-top: 10px; }
-  summary { color: var(--accent); cursor: pointer; font-size: 12.5px; }
-  details input { width: 100%; margin-top: 8px; font: inherit; padding: 9px 11px;
-                  border-radius: 8px; border: 1px solid var(--line);
-                  background: #0a1a26; color: var(--ink); }
   #log { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px;
          color: var(--muted); white-space: pre-wrap; word-break: break-word; margin: 14px 0 0; }
   .err { color: var(--halted); }
@@ -80,13 +75,10 @@
       <div class="row">
         <code id="account">…</code>
         <button id="copy">Copy</button>
+        <button id="fundbtn" disabled>Fund 10 GEN</button>
       </div>
+      <p class="hint" id="balance"></p>
       <p class="hint" id="fund"></p>
-      <details>
-        <summary>Use an already-funded key instead</summary>
-        <input id="pk" placeholder="0x… private key (kept in this browser only)" />
-        <button id="usepk" style="margin-top:8px">Use this key</button>
-      </details>
     </div>
   </div>
 
@@ -166,6 +158,63 @@ function studioNextChain(sdk, chains) {
   return typeof sdk.defineChain === "function" ? sdk.defineChain(definition) : definition;
 }
 
+// sim_fundAccount and eth_getBalance are node methods, not contract calls, so
+// they go over plain JSON-RPC rather than through the SDK client.
+async function rpc(method, params) {
+  const response = await fetch(CONFIG.rpcUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: Date.now(), method, params }),
+  });
+  const body = await response.json();
+  // Surface the RPC's own error (rate limits land here) instead of hiding it.
+  if (body.error) {
+    throw new Error(body.error.message ?? JSON.stringify(body.error));
+  }
+  return body.result;
+}
+
+function formatGen(wei) {
+  const whole = wei / 10n ** 18n;
+  const frac = (wei % 10n ** 18n).toString().padStart(18, "0").slice(0, 4);
+  return `${whole}.${frac} GEN`;
+}
+
+async function refreshBalance() {
+  const balance = document.getElementById("balance");
+  if (!account) return (balance.textContent = "");
+  try {
+    const wei = BigInt(await rpc("eth_getBalance", [account.address, "latest"]));
+    const funded = wei > 0n;
+    balance.textContent = `Balance: ${formatGen(wei)}${funded ? "" : " — fund before assessing"}`;
+    balance.className = funded ? "hint" : "hint warn";
+    return wei;
+  } catch (error) {
+    balance.textContent = `Balance unavailable: ${error.message}`;
+    balance.className = "hint warn";
+  }
+}
+
+// The dev faucet Studio's own Fund button uses. The amount is wei as a string:
+// passing a bare 10 would send ten wei, which looks like success but cannot
+// cover a fee.
+const FUND_AMOUNT_WEI = "10000000000000000000";
+
+async function fundAccount() {
+  const button = document.getElementById("fundbtn");
+  button.disabled = true;
+  try {
+    say(`Requesting ${formatGen(BigInt(FUND_AMOUNT_WEI))} from the dev faucet…`);
+    await rpc("sim_fundAccount", [account.address, FUND_AMOUNT_WEI]);
+    await refreshBalance();
+    say("Funded. You can run an assessment now.");
+  } catch (error) {
+    say(`Funding failed: ${error.message}`, true);
+  } finally {
+    button.disabled = !account;
+  }
+}
+
 // assess() is a write and Studio Next charges a fee, so the caller needs GEN.
 // A throwaway account generated per page load would be unfundable: its address
 // changes on every reload. So the key is generated once, kept in localStorage,
@@ -198,17 +247,19 @@ function buildAccount(sdk, privateKey) {
   return null;
 }
 
-async function connect(privateKey) {
+async function connect() {
   const [sdk, chains] = await Promise.all([
     import("https://esm.sh/genlayer-js"),
     import("https://esm.sh/genlayer-js/chains"),
   ]);
-  const key = privateKey || localStorage.getItem(STORAGE_KEY) || newPrivateKey();
+  const key = localStorage.getItem(STORAGE_KEY) || newPrivateKey();
   const built = buildAccount(sdk, key);
-  // Persist only after the key proves usable: overwriting the stored key with
-  // a bad paste would strand an account the user had already funded.
-  if (built) localStorage.setItem(STORAGE_KEY, key);
-  account = built;
+  if (built) {
+    // Persist only once the key proves usable, so a future SDK change that
+    // rejects it cannot overwrite a key whose account holds funds.
+    localStorage.setItem(STORAGE_KEY, key);
+    account = built;
+  }
   // Paint the account before touching the network: if the connection fails the
   // user should still see (and be able to fund) their address.
   showAccount();
@@ -232,11 +283,13 @@ function showAccount() {
       "works. See the console for which genlayer-js factory was tried.";
     return;
   }
+  document.getElementById("fundbtn").disabled = false;
+  refreshBalance();
   fund.className = "hint";
   fund.innerHTML =
-    "Reading verdicts is free. <b>Running an assessment costs GEN</b>, so fund " +
-    "this address from the Studio Next faucet first. The key is kept in this " +
-    "browser, so the address stays the same across reloads — testnet only.";
+    "Reading verdicts is free. <b>Running an assessment costs GEN</b>, so use " +
+    "Fund first. The key is generated and kept in this browser, so the address " +
+    "stays the same across reloads — testnet only.";
 }
 
 async function loadChains() {
@@ -320,22 +373,11 @@ async function runAssessment(chainId) {
   }
 }
 
+document.getElementById("fundbtn").addEventListener("click", fundAccount);
+
 document.getElementById("copy").addEventListener("click", () => {
   navigator.clipboard?.writeText(account?.address ?? "");
   say("Session address copied. Fund it, then run an assessment.");
-});
-
-document.getElementById("usepk").addEventListener("click", async () => {
-  const key = document.getElementById("pk").value.trim();
-  if (!key) return say("Paste a private key first.", true);
-  try {
-    const usable = await connect(key);
-    el.run.disabled = !usable;
-    await loadChains();
-    say(usable ? "Using the supplied key." : "That key was not usable.", !usable);
-  } catch (error) {
-    say(`Could not use that key: ${error?.message ?? error}`, true);
-  }
 });
 
 el.run.addEventListener("click", () => runAssessment(el.chain.value));
