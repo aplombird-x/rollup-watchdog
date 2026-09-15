@@ -22,8 +22,10 @@ Data sources
   - Latest block: GET <blockscout_url>/api/v2/blocks?type=block. Both the
     {"items": [...]} envelope and a bare list are accepted, as are "height"
     and "number" keys — Blockscout instances differ.
-  - Ethereum mainnet (eth.blockscout.com) is a trusted wall clock, accurate to
-    ~12s. That is what makes block age a measurement rather than a guess.
+  - The wall clock is the latest block of two independent Blockscout
+    deployments, whichever is later. One is not enough: a lagging indexer
+    reports an old "now", which makes a stalled chain look fresh. Skew past
+    tolerance gives INDETERMINATE rather than a silent clamp.
   - Timestamps are ISO-8601 UTC. GenVM's stdlib subset may lack datetime, so
     _civil_to_unix() uses plain arithmetic; the tests check it against
     calendar.timegm over 20,000 dates.
@@ -74,8 +76,18 @@ from genlayer.types import *
 # INDETERMINATE is set by the contract, never accepted from the model.
 MODEL_STATUSES = ("HEALTHY", "DEGRADED", "HALTED")
 
-# Ethereum mainnet, used only as a trusted clock.
-CLOCK_BLOCKSCOUT_URL = "https://eth.blockscout.com"
+# Wall clocks, used for nothing else. Neither may be an assessed chain, or
+# _read_clock skips it and leaves that chain with one clock. Measured
+# 2026-09-15: eth 59 minutes behind, gnosis 1 minute. gnosis redirects to
+# gnosisscan.io but serves correct Blockscout JSON; substitute any other plain
+# Blockscout deployment if validators are throttled there.
+CLOCK_SOURCES = (
+    "https://eth.blockscout.com",
+    "https://gnosis.blockscout.com",
+)
+# How far the clock may sit behind a chain's newest block before the reading is
+# treated as unusable. One clock block (~12s) of lag is normal; a minute is not.
+CLOCK_SKEW_TOLERANCE_SECONDS = 60
 BLOCKS_PATH = "/api/v2/blocks?type=block"
 
 MAX_SUMMARY_CHARS = 280
@@ -311,6 +323,27 @@ def _fetch_block(url: str) -> tuple:
     return None, None, reason
 
 
+def _read_clock(chain_url: str) -> tuple:
+    """Wall clock from CLOCK_SOURCES: (latest timestamp or None, failures).
+
+    The latest reading wins, so a lagging source cannot pull the clock
+    backwards. One source failing is survivable; all of them failing is not.
+    """
+    newest = None
+    problems = []
+    for url in CLOCK_SOURCES:
+        if chain_url and url.rstrip("/") == chain_url.rstrip("/"):
+            # Never time a chain by its own explorer: an outage would freeze
+            # the very clock that is supposed to expose it.
+            continue
+        _, timestamp, problem = _fetch_block(_latest_block_url(url))
+        if problem:
+            problems.append(f"{url}: {problem}")
+        elif newest is None or timestamp > newest:
+            newest = timestamp
+    return newest, problems
+
+
 def _parse_status_page(raw: str) -> str:
     """statuspage.io /api/v2/status.json -> just {indicator, description}.
 
@@ -444,16 +477,14 @@ class RollupWatchdog(gl.contract.Contract):
         last_assessed_at = self._last_assessed_at(chain_id)
 
         def run_assessment() -> str:
-            # ---- Trusted clock: mainnet's latest block timestamp is "now" ----
-            _, now, clock_problem = _fetch_block(
-                _latest_block_url(CLOCK_BLOCKSCOUT_URL)
-            )
-            if clock_problem:
+            # ---- Trusted clock: the later of two independent sources ----
+            now, clock_problems = _read_clock(blockscout_url)
+            if now is None:
                 # No trusted clock means nothing honest to store.
-                _fail(f"clock (mainnet): {clock_problem}")
+                _fail("clock: " + ("; ".join(clock_problems) or "no usable source"))
 
             # Throttle: each assessment costs every validator an LLM call and
-            # up to three fetches, so unthrottled spam would degrade the oracle.
+            # up to four fetches, so unthrottled spam would degrade the oracle.
             if (
                 last_assessed_at
                 and now - last_assessed_at < MIN_ASSESS_INTERVAL_SECONDS
@@ -478,10 +509,21 @@ class RollupWatchdog(gl.contract.Contract):
                     None,
                     now,
                 )
-            # The mainnet clock lags real time by up to one block (~12s), so a
-            # fast L2 can report a block newer than "now". Clamp rather than
-            # emit a negative age; ages under ~12s are not meaningful anyway.
-            age_seconds = max(0, now - block_timestamp)
+            # A fast L2 a few seconds ahead of the clock is noise, so clamp it.
+            # A large gap means the clock is stale, and clamping that to 0 would
+            # report any outage shorter than the lag as perfectly fresh.
+            raw_age = now - block_timestamp
+            if raw_age < -CLOCK_SKEW_TOLERANCE_SECONDS:
+                return _build_verdict(
+                    "INDETERMINATE",
+                    f"The wall clock is {-raw_age}s behind {chain_name}'s latest "
+                    "block, so block age cannot be measured and the chain's health "
+                    "cannot be determined right now.",
+                    block_number,
+                    None,
+                    now,
+                )
+            age_seconds = max(0, raw_age)
 
             # ---- Live signal 2: official status page (optional) ----
             status_page = ""
