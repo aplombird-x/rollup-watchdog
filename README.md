@@ -155,6 +155,13 @@ from a CDN, so there is no build step and no `node_modules`.
 deployment — change it only if you deploy your own. Serve locally with
 `python3 -m http.server`, or publish via **Settings → Pages → main / root**.
 
+The page defines its own chain rather than using a bundled one. Each Studio
+instance has a distinct chain id — **dev 61997, staging 61998, production
+61999** — and `genlayer-js` ships `studionet` pointing at production, so it
+cannot reach a dev deployment. The dashboard therefore targets
+`https://studio-dev.genlayer.com/api` with `id: 61997` via `defineChain`. That
+endpoint allows cross-origin requests, so GitHub Pages can call it directly.
+
 Reading verdicts is free. **Running an assessment is a write and costs GEN**,
 so the page generates a session account, keeps its key in `localStorage` (the
 address is therefore stable across reloads) and displays it to be funded from
@@ -298,6 +305,9 @@ and official chain status channels — signals, failure modes, and consumers
 
 ## Links
 
+- Live dashboard: https://aplombird-x.github.io/rollup-watchdog/
+- Contract on Studio Next:
+  https://explorer-studio-dev.genlayer.com/address/0x3D62e1a41552Fc38BB6c7DAC95DF94D082163F45
 - Demo video: ← add
 - Agent Tank submission: ← add
 - Built for the GenLayer Agent Tank hackathon, Sep 2026.
