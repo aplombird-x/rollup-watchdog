@@ -40,6 +40,8 @@
   .HALTED .dot { background: var(--halted); } .HALTED .status { color: var(--halted); }
   .INDETERMINATE .dot { background: var(--unknown); } .INDETERMINATE .status { color: var(--unknown); }
   .summary { margin: 0 0 14px; }
+  .evidence { margin: 14px 0 0; font-size: 14px; }
+  .evidence a { color: var(--accent); }
   .facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
   .fact { background: #091825; border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
   .fact b { display: block; font-size: 11px; letter-spacing: .06em; text-transform: uppercase;
@@ -86,6 +88,7 @@
     <div class="verdict-head"><span class="dot"></span><span class="status"></span></div>
     <p class="summary"></p>
     <div class="facts"></div>
+    <p class="evidence"></p>
   </div>
 
   <footer>
@@ -295,7 +298,7 @@ async function loadChains() {
   return configured;
 }
 
-function render(json) {
+function render(json, txHash) {
   if (!json) {
     el.verdict.hidden = true;
     return;
@@ -328,9 +331,18 @@ function render(json) {
       clockOff || stale ? "stale" : "",
     ),
   ].join("");
+
+  // The validator set, their votes and any rotations are the evidence behind
+  // the verdict, and they live on the explorer. A stored verdict carries no
+  // transaction hash, so fall back to the contract's whole history.
+  const link = (href, text) =>
+    `<a href="${href}" target="_blank" rel="noreferrer">${text} &rarr;</a>`;
+  el.verdict.querySelector(".evidence").innerHTML = txHash
+    ? link(`${CONFIG.explorer}/tx/${txHash}`, "See how the validators voted")
+    : link(`${CONFIG.explorer}/address/${CONFIG.contract}`, "See every assessment on the explorer");
 }
 
-async function readVerdict(chainId) {
+async function readVerdict(chainId, txHash) {
   say(`Reading stored verdict for ${chainId}…`);
   const stored = await client.readContract({
     address: CONFIG.contract, functionName: "get_assessment", args: [chainId],
@@ -340,7 +352,7 @@ async function readVerdict(chainId) {
     say(`No verdict stored yet for ${chainId}. Run an assessment to create one.`);
     return;
   }
-  render(stored);
+  render(stored, txHash);
   say(`Latest consensus verdict for ${chainsById[chainId]?.name ?? chainId}.`);
 }
 
@@ -385,7 +397,7 @@ async function runAssessment(chainId) {
       );
     }
     say(`Consensus reached. Transaction ${hash}`);
-    await readVerdict(chainId);
+    await readVerdict(chainId, hash);
   } catch (error) {
     // An unfunded account and the 60s throttle are both expected; name them.
     const detail = String(error?.message ?? error);
