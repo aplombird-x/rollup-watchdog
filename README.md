@@ -21,8 +21,9 @@ and validator consensus makes it trustless — which is what GenLayer is for.
 
 1. Anyone calls `assess(chain_id)`.
 2. Each validator independently fetches:
-   - a **trusted clock** — Ethereum mainnet's latest block timestamp (~12s
-     accurate), used to *measure* how stale the L2's latest block is,
+   - a **trusted clock** — the latest block of two independent Blockscout
+     deployments, whichever is later, used to *measure* how stale the L2's
+     latest block is,
    - the **L2's latest block** via that chain's Blockscout API,
    - the chain's **official status page**, where one exists.
 3. The contract computes block age itself. The LLM judges **only** the status
@@ -106,7 +107,7 @@ A real verdict, read back from the deployed contract via `get_assessment("base")
 | `block_number` | Blockscout | `null` when `INDETERMINATE` |
 | `block_age_seconds` | measured | `null` when `INDETERMINATE` |
 | `block_age_bucket` | measured | `<1min` \| `1-5min` \| `5-30min` \| `>30min` \| `UNKNOWN`; validators compare this exactly |
-| `assessed_at_unix` | mainnet clock | Check before trusting a verdict |
+| `assessed_at_unix` | wall clock | Check before trusting a verdict |
 
 ## Deploy
 
@@ -136,7 +137,7 @@ block freshness alone — a supported configuration, not a degraded one.
 
 **Current deployment**
 
-- **Studio Next** (chain 61997): `0x3D62e1a41552Fc38BB6c7DAC95DF94D082163F45`
+- **Studio Next** (chain 61997): `0x9bB01d8B136527698f6196a28aD657e8800E22B7`
 - Owner (deployer; the only account that can call `add_chain`):
   `0x4e2eb6e59d37b792AeAc7F0682b3Ff8fcbAc21Be`
 - Chains: Base (block freshness + status page), Arbitrum One and ZKsync Era
@@ -155,6 +156,13 @@ from a CDN, so there is no build step and no `node_modules`.
 deployment — change it only if you deploy your own. Serve locally with
 `python3 -m http.server`, or publish via **Settings → Pages → main / root**.
 
+Writes follow the documented flow: `estimateTransactionFeesForWrite`, then
+`writeContract` with `fees: { distribution, feeValue }`, then
+`waitForDecision` and `isSuccessful`. Studio charges for execution and the
+consensus contract rejects a zero fee, so the estimate is not optional. Note
+that finalized does not imply succeeded — hence the `isSuccessful` check. The
+SDK is pinned to `2.0.0-rc.1`; npm's `latest` (1.1.8) predates this fee model.
+
 The page defines its own chain rather than using a bundled one. Each Studio
 instance has a distinct chain id — **dev 61997, staging 61998, production
 61999** — and `genlayer-js` ships `studionet` pointing at production, so it
@@ -163,9 +171,11 @@ cannot reach a dev deployment. The dashboard therefore targets
 endpoint allows cross-origin requests, so GitHub Pages can call it directly.
 
 Reading verdicts is free. **Running an assessment is a write and costs GEN**,
-so the page generates a session account, keeps its key in `localStorage` (the
-address is therefore stable across reloads) and displays it to be funded from
-the Studio Next faucet. You can paste an already-funded key instead.
+so the page generates a session account and keeps its key in `localStorage`,
+which makes the address stable across reloads and therefore fundable. A **Fund
+10 GEN** button calls the dev faucet (`sim_fundAccount`, the same JSON-RPC
+method Studio's own button uses) and the balance is shown next to it. Testnet
+only — a key in `localStorage` is readable by any script on the origin.
 
 The chain list comes from `list_chains()` rather than being hardcoded, so the
 page reflects the actual deployment and labels each chain one-signal or two.
@@ -175,7 +185,7 @@ numbers, and how old the verdict is.
 ## Tests
 
 ```bash
-python3 test_rollup_watchdog.py    # 62 tests, no dependencies
+python3 test_rollup_watchdog.py    # 68 tests, no dependencies
 pytest test_rollup_watchdog.py     # if pytest is available
 ```
 
@@ -215,6 +225,13 @@ A namespace mismatch gives no useful message — the schema loader executes the
 module, so an import-time failure surfaces as *"Could not load contract
 schema"* with empty stdout and stderr.
 
+Note that the published contract docs still show the pre-v0.3.0 style
+(`from genlayer import *`, `gl.Contract`, bare `TreeMap`) and pin the older
+`py-genlayer` hash. The version here is the one that actually deploys and runs
+on Studio Next. Everything else the docs describe — `gl.nondet.web.get()`
+returning an object with `.body`, `exec_prompt(..., response_format="json")`,
+`gl.eq_principle.prompt_comparative`, `gl.vm.UserError` — matches.
+
 Three GenVM behaviours the docs don't mention, each found by deploying:
 
 - **`gl.nondet.web.get()` returns a `Response`, not a string.** `json.loads()`
@@ -232,7 +249,19 @@ Three GenVM behaviours the docs don't mention, each found by deploying:
 Confirmed on **Studio Next** (chain 61997). Every transaction reached
 `FINALIZED` / `SUCCESS` with `rotation_count: 0` — no leader rotations.
 
-- **Deployment** `0x1c2f49d8…1d801b` — the v0.3.0 namespace loads and runs.
+- **Deployment** `0x1b61fe8a…5fa669` — `SUCCESS`, 5 validators, 0 rotations.
+- **The clock fix, measured** — `assess("base")` `0x9b2fac72…6a2c75` stamped
+  `assessed_at_unix` at 22:10:00Z, the same second the transaction was created.
+  `eth.blockscout.com` was 44–59 minutes behind that day, so a single-source
+  clock would have stamped it ~45 minutes stale and clamped any real block age
+  to `0`. Two sources, later reading wins, and the clock is current. This also
+  confirms GenVM follows the gnosis redirect from inside validators.
+
+Earlier runs on the previous deployment (`0x3D62e1a4…163F45`) established the
+rest, though their `block_age_seconds: 0` is the old clamp hiding that lagging
+clock, not a measured zero:
+
+- **Namespace** `0x1c2f49d8…1d801b` — the v0.3.0 namespace loads and runs.
 - **Two signals** — `assess("base")` `0xe6367270…cf8f4` returned `HEALTHY`,
   citing both: *"Block production is current with a 0-second gap, and the
   third-party status page reports all systems operational."*
@@ -242,6 +271,9 @@ Confirmed on **Studio Next** (chain 61997). Every transaction reached
   indicate a problem."* That is the missing-signal rule holding in production.
 - **Views** — `get_assessment("base")` returns the stored verdict and
   `get_assessment_count()` returns `2`, so `u256` works as a view return type.
+- **Dashboard write** — `0x31606536…33cdb2`, submitted from the browser session
+  account, reached `FINALIZED` / `Accepted` with `rotation_count: 0` and a
+  transaction value of `0 GEN`: the fee travels in `fees`, not `value`.
 
 The same behaviour was confirmed earlier on Bradbury under the pre-v0.3.0
 namespace. A minority validator may still vote Disagree — one did there, on an
@@ -263,16 +295,28 @@ Two lessons came from reading live verdicts rather than from tests:
 
 - **Blockscout is a single data source, and its two roles fail differently.**
   If a chain's own Blockscout is unreachable the verdict is `INDETERMINATE` and
-  is stored. If the clock (`eth.blockscout.com`) is unreachable the call fails
-  outright and nothing is stored — without a trusted clock there is no honest
-  verdict to write.
+  is stored. If *every* clock source is unreachable the call fails outright and
+  nothing is stored — without a trusted clock there is no honest verdict to
+  write.
 - **Timestamps are assumed UTC.** An instance returning a non-UTC offset would
-  be mis-read by that offset.
-- **Block age is only accurate to ~12s**, the mainnet block time. An L2 block
-  newer than mainnet's latest clamps to `0`, so ages under ~12s are not
-  meaningfully distinguishable. Ample for the >30min decisions this oracle
-  makes, but `block_age_seconds: 0` means "at least as fresh as mainnet", not
-  "produced this instant".
+  be mis-read by that offset. Nothing else is timezone-dependent: the contract
+  works in Unix seconds and never reads a validator's local clock, and the
+  dashboard compares `Date.now()` (epoch-based) against `assessed_at_unix`, so
+  verdict age is identical worldwide. It does assume the viewer's device clock
+  is roughly correct; a clock more than two minutes behind is reported rather
+  than silently shown as a fresh verdict.
+- **Block age is only accurate to one clock block (~12s).** An L2 block newer
+  than the clock's latest clamps to `0`, so ages under ~12s are not meaningfully
+  distinguishable. Ample for the >30min decisions this oracle makes, but
+  `block_age_seconds: 0` means "at least as fresh as the clock", not "produced
+  this instant".
+- **The clock is a real dependency.** On 2026-09-15 `eth.blockscout.com` ran
+  59 minutes behind while `gnosis.blockscout.com` ran 1 minute behind. A single
+  lagging source reports an old "now", which would have marked any outage
+  shorter than the lag as `HEALTHY`. Hence two sources, later reading wins, and
+  skew past `CLOCK_SKEW_TOLERANCE_SECONDS` returns `INDETERMINATE` instead of a
+  clamp. The gnosis URL redirects to gnosisscan.io but serves correct Blockscout
+  JSON; substitute another Blockscout deployment if validators are throttled.
 - **The 30-minute `HEALTHY` floor is blunt.** It bounds prompt injection rather
   than modelling any chain; a genuinely sparse rollup would read `DEGRADED`.
 - **Verdicts are overwritten, not appended.** No history yet.
@@ -307,7 +351,7 @@ and official chain status channels — signals, failure modes, and consumers
 
 - Live dashboard: https://aplombird-x.github.io/rollup-watchdog/
 - Contract on Studio Next:
-  https://explorer-studio-dev.genlayer.com/address/0x3D62e1a41552Fc38BB6c7DAC95DF94D082163F45
+  https://explorer-studio-dev.genlayer.com/address/0x9bB01d8B136527698f6196a28aD657e8800E22B7
 - Demo video: ← add
 - Agent Tank submission: ← add
 - Built for the GenLayer Agent Tank hackathon, Sep 2026.
