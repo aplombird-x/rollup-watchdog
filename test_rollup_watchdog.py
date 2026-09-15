@@ -7,9 +7,9 @@ Python: Blockscout parsing, timestamp conversion, status-page extraction,
 config validation, the throttle, and how `assess()` assembles a verdict from
 measured values.
 
-The stub deliberately mirrors what GenLayer Studio actually showed:
-`gl.nondet.web.get()` returns a Response object, `exec_prompt()` returns an
-already-parsed dict, and `gl.UserError` does not exist in this build.
+The stub mirrors the Studio Next (v0.3.0) namespace and the SDK shapes observed
+there: `gl.nondet.web.get()` returns a Response object, `exec_prompt()` returns
+an already-parsed dict, and the error type lives at `gl.vm.UserError`.
 
 What this does NOT cover: consensus, storage semantics, nondet isolation.
 Deploy to GenLayer Studio for those.
@@ -41,7 +41,12 @@ class FakeResponse:
 
 
 def _install_genlayer_stub() -> None:
-    """Minimal stand-in for the `genlayer` module GenVM injects."""
+    """Stand-in for the modules GenVM injects, in the v0.3.0 namespace.
+
+    The contract does `import genlayer as gl` + `from genlayer.types import *`,
+    so both `genlayer` and `genlayer.types` must exist, and the surface hangs
+    off sub-namespaces (gl.contract, gl.storage, gl.vm, gl.public, gl.nondet).
+    """
 
     class TreeMap(dict):
         def __class_getitem__(cls, item):
@@ -50,16 +55,14 @@ def _install_genlayer_stub() -> None:
     class Contract:
         pass
 
+    class UserError(Exception):
+        pass
+
     def _unstubbed(name):
         def fail(*_args, **_kwargs):
             raise AssertionError(f"test must stub {name}")
 
         return fail
-
-    nondet = types.SimpleNamespace(
-        web=types.SimpleNamespace(get=_unstubbed("gl.nondet.web.get")),
-        exec_prompt=_unstubbed("gl.nondet.exec_prompt"),
-    )
 
     captured_criteria = []
 
@@ -70,28 +73,36 @@ def _install_genlayer_stub() -> None:
         captured_criteria.append(criteria)
         return fn()
 
-    module = types.ModuleType("genlayer")
-    # Matching the deployed build: no UserError, no Rollback, no
-    # rollback_immediate. The contract must fall back to its own error type.
-    module.captured_criteria = captured_criteria
-    module.gl = types.SimpleNamespace(
-        Contract=Contract,
-        nondet=nondet,
-        eq_principle=types.SimpleNamespace(prompt_comparative=prompt_comparative),
-        message=types.SimpleNamespace(sender_address=OWNER),
-        public=types.SimpleNamespace(write=lambda f: f, view=lambda f: f),
+    genlayer = types.ModuleType("genlayer")
+    genlayer.contract = types.SimpleNamespace(Contract=Contract)
+    genlayer.storage = types.SimpleNamespace(TreeMap=TreeMap)
+    # Studio Next exposes the error type here; Bradbury exposed it nowhere.
+    genlayer.vm = types.SimpleNamespace(UserError=UserError)
+    genlayer.nondet = types.SimpleNamespace(
+        web=types.SimpleNamespace(get=_unstubbed("gl.nondet.web.get")),
+        exec_prompt=_unstubbed("gl.nondet.exec_prompt"),
     )
-    module.Address = str
-    module.u256 = int
-    module.TreeMap = TreeMap
-    sys.modules["genlayer"] = module
+    genlayer.eq_principle = types.SimpleNamespace(
+        prompt_comparative=prompt_comparative
+    )
+    genlayer.message = types.SimpleNamespace(sender_address=OWNER)
+    genlayer.public = types.SimpleNamespace(write=lambda f: f, view=lambda f: f)
+    genlayer.captured_criteria = captured_criteria
+
+    genlayer_types = types.ModuleType("genlayer.types")
+    genlayer_types.Address = str
+    genlayer_types.u256 = int
+    genlayer.types = genlayer_types
+
+    sys.modules["genlayer"] = genlayer
+    sys.modules["genlayer.types"] = genlayer_types
 
 
 _install_genlayer_stub()
 sys.path.insert(0, str(CONTRACT_DIR))
 
 import rollup_watchdog as rw  # noqa: E402
-from genlayer import gl  # noqa: E402
+import genlayer as gl  # noqa: E402
 
 CHAIN = {
     "id": "base",
@@ -147,8 +158,8 @@ def make_contract_raw(chains_json, sender=OWNER):
     contract = rw.RollupWatchdog.__new__(rw.RollupWatchdog)
     # GenVM initializes declared storage; mirror that for the TreeMap fields.
     for name, annotation in rw.RollupWatchdog.__annotations__.items():
-        if annotation is rw.TreeMap:
-            setattr(contract, name, rw.TreeMap())
+        if annotation is gl.storage.TreeMap:
+            setattr(contract, name, gl.storage.TreeMap())
     contract.__init__(chains_json)
     return contract
 
@@ -218,26 +229,31 @@ def healthy_model(summary="Blocks are flowing normally."):
 # --------------------------------------------------------------------------
 
 
+def test_error_type_uses_the_build_provided_type():
+    # Studio Next keeps it at gl.vm.UserError — nested, so a flat getattr would
+    # miss it and silently fall back to the contract's own error class.
+    assert rw.ERROR is gl.vm.UserError
+
+
 def test_error_type_falls_back_when_the_build_exposes_nothing():
-    # Bradbury has no gl.UserError / Rollback / rollback_immediate. Raising a
-    # hardcoded name threw AttributeError *while handling* the real error,
-    # hiding it — so the contract supplies its own type.
-    assert not hasattr(gl, "UserError")
-    assert not hasattr(gl, "rollback_immediate")
-    assert rw.ERROR.__name__ == "ContractFailure"
-    assert issubclass(rw.ERROR, Exception)
-
-
-def test_error_type_prefers_a_build_provided_type():
-    class Rollback(Exception):
-        pass
-
-    rw.__dict__["Rollback"] = Rollback
+    # Bradbury exposed no user-facing error type at all. The contract must
+    # still load and still be able to fail.
+    saved = gl.vm
+    gl.vm = types.SimpleNamespace()
     try:
-        assert rw._resolve_error_type() is Rollback
+        fallback = rw._resolve_error_type()
+        assert fallback.__name__ == "ContractFailure"
+        assert issubclass(fallback, Exception)
     finally:
-        del rw.__dict__["Rollback"]
-    assert rw._resolve_error_type().__name__ == "ContractFailure"
+        gl.vm = saved
+    assert rw._resolve_error_type() is gl.vm.UserError
+
+
+def test_lookup_resolves_dotted_paths_without_raising():
+    assert rw._lookup("vm.UserError") is gl.vm.UserError
+    assert rw._lookup("nope") is None
+    assert rw._lookup("vm.nope.deeper") is None
+    assert rw._lookup("") is None
 
 
 def test_fail_prefers_rollback_immediate_when_the_build_has_it():
@@ -338,6 +354,21 @@ def test_to_unix_rejects_what_it_cannot_read():
 
 def test_read_block_reads_the_items_envelope():
     assert rw._read_block(block_body(16, 1_700_000_000)) == (16, 1_700_000_000, "")
+
+
+def test_read_block_falls_through_a_null_height():
+    # Accepting both keys is pointless if a present-but-null "height" masks the
+    # "number" beside it.
+    body = json.dumps(
+        {"items": [{"height": None, "number": 42, "timestamp": 1_700_000_000}]}
+    )
+    assert rw._read_block(body) == (42, 1_700_000_000, "")
+
+
+def test_read_block_accepts_block_height_zero():
+    # Genesis is a legitimate height; it must not be treated as missing.
+    body = json.dumps({"items": [{"height": 0, "timestamp": 1_700_000_000}]})
+    assert rw._read_block(body) == (0, 1_700_000_000, "")
 
 
 def test_read_block_accepts_instance_variations():
@@ -680,7 +711,7 @@ def test_consensus_criteria_excuse_the_volatile_fields():
     stub_network(now=1_700_000_000, l2_timestamp=1_699_999_995)
     healthy_model()
     contract.assess("base")
-    criteria = sys.modules["genlayer"].captured_criteria[-1].lower()
+    criteria = gl.captured_criteria[-1].lower()
 
     # The two fields every validator must agree on.
     assert "'status'" in criteria and "'block_age_bucket'" in criteria
@@ -691,6 +722,19 @@ def test_consensus_criteria_excuse_the_volatile_fields():
     # No promise of a tolerance the physical world can violate.
     assert "a few blocks" not in criteria
     assert "under a minute" not in criteria
+
+
+def test_assess_clamps_an_l2_block_newer_than_the_mainnet_clock():
+    # The mainnet clock lags real time by up to one block, so a fast L2 routinely
+    # reports a block newer than "now". Both live Studio Next verdicts showed
+    # block_age_seconds: 0 for exactly this reason; a negative age must never
+    # reach storage.
+    contract = make_contract()
+    stub_network(now=1_700_000_000, l2_timestamp=1_700_000_007)
+    healthy_model()
+    verdict = json.loads(contract.assess("base"))
+    assert verdict["block_age_seconds"] == 0
+    assert verdict["block_age_bucket"] == "<1min"
 
 
 def test_assess_ignores_numbers_and_extra_keys_from_the_model():
