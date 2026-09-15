@@ -174,17 +174,27 @@ def stub_network(
     l2_block=42,
     l2_body=None,
     clock_body=None,
+    clock_bodies=None,
     status_page=OPERATIONAL_PAGE,
 ):
     """Stub the SDK boundary itself, so response unwrapping is exercised too.
 
-    Routing is by host: the clock and the L2 are separate Blockscout instances,
+    Routing is by host: the clocks and the L2 are separate Blockscout instances,
     which is the whole point of the migration off a single rate-limited key.
-    `status_page=None` simulates an unreachable status page.
+    `status_page=None` simulates an unreachable status page. `clock_bodies` maps
+    a clock URL to its own body (None = unreachable), for testing sources that
+    disagree; `clock_body` sets every clock at once.
     """
 
     def fake_get(url):
-        if url.startswith(rw.CLOCK_BLOCKSCOUT_URL):
+        for source in rw.CLOCK_SOURCES:
+            if not url.startswith(source):
+                continue
+            if clock_bodies is not None and source in clock_bodies:
+                body = clock_bodies[source]
+                if body is None:
+                    raise RuntimeError("clock source unreachable")
+                return FakeResponse(body)
             return FakeResponse(
                 clock_body if clock_body is not None else block_body(1, now)
             )
@@ -696,8 +706,8 @@ def test_assess_uses_separate_hosts_for_clock_and_chain():
     gl.nondet.web.get = recording
     healthy_model()
     contract.assess("base")
-    assert urls[0].startswith(rw.CLOCK_BLOCKSCOUT_URL)
-    assert urls[1].startswith(CHAIN["blockscout_url"])
+    assert urls[0].startswith(rw.CLOCK_SOURCES[0])
+    assert urls[len(rw.CLOCK_SOURCES)].startswith(CHAIN["blockscout_url"])
     assert urls[0].split("/api/")[0] != urls[1].split("/api/")[0]
     # No shared credential anywhere: that was the whole rate-limit problem.
     assert not any("apikey" in u for u in urls)
@@ -724,17 +734,95 @@ def test_consensus_criteria_excuse_the_volatile_fields():
     assert "under a minute" not in criteria
 
 
-def test_assess_clamps_an_l2_block_newer_than_the_mainnet_clock():
-    # The mainnet clock lags real time by up to one block, so a fast L2 routinely
-    # reports a block newer than "now". Both live Studio Next verdicts showed
-    # block_age_seconds: 0 for exactly this reason; a negative age must never
-    # reach storage.
+def test_assess_clamps_an_l2_block_newer_than_the_clock():
+    # A clock lags real time by up to one of its own blocks, so a fast L2
+    # routinely reports a block newer than "now". A negative age must never
+    # reach storage. Larger gaps are clock skew, not noise -- see
+    # test_assess_is_indeterminate_when_the_clock_is_stale.
     contract = make_contract()
     stub_network(now=1_700_000_000, l2_timestamp=1_700_000_007)
     healthy_model()
     verdict = json.loads(contract.assess("base"))
     assert verdict["block_age_seconds"] == 0
     assert verdict["block_age_bucket"] == "<1min"
+
+
+def test_read_clock_takes_the_later_of_two_sources():
+    # The whole point of a second source: a lagging indexer reports an old
+    # "now", and an old "now" makes a stalled chain look freshly produced.
+    stub_network(
+        now=0,
+        clock_bodies={
+            rw.CLOCK_SOURCES[0]: block_body(1, 1_700_000_000),
+            rw.CLOCK_SOURCES[1]: block_body(2, 1_700_002_400),
+        },
+    )
+    now, problems = rw._read_clock("")
+    assert now == 1_700_002_400
+    assert problems == []
+
+
+def test_read_clock_survives_one_dead_source():
+    stub_network(
+        now=0,
+        clock_bodies={
+            rw.CLOCK_SOURCES[0]: None,
+            rw.CLOCK_SOURCES[1]: block_body(2, 1_700_000_000),
+        },
+    )
+    now, problems = rw._read_clock("")
+    assert now == 1_700_000_000
+    assert len(problems) == 1
+
+
+def test_read_clock_fails_only_when_every_source_is_down():
+    stub_network(now=0, clock_bodies={s: None for s in rw.CLOCK_SOURCES})
+    now, problems = rw._read_clock("")
+    assert now is None
+    assert len(problems) == len(rw.CLOCK_SOURCES)
+
+
+def test_read_clock_never_times_a_chain_by_its_own_explorer():
+    # An outage would otherwise freeze the very clock meant to expose it.
+    stub_network(now=1_700_000_000)
+    inner = gl.nondet.web.get
+    urls = []
+
+    def recording(url):
+        urls.append(url)
+        return inner(url)
+
+    gl.nondet.web.get = recording
+    assert rw._read_clock(rw.CLOCK_SOURCES[0])[0] is not None
+    assert not any(u.startswith(rw.CLOCK_SOURCES[0]) for u in urls)
+
+
+def test_assess_is_indeterminate_when_the_clock_is_stale():
+    # The bug this guards: under max(0, now - block_timestamp) a clock running
+    # 44 minutes behind reported every outage shorter than 44 minutes as a
+    # 0-second block age, i.e. as perfectly healthy.
+    contract = make_contract()
+    stub_network(now=1_700_000_000, l2_timestamp=1_700_002_640)
+    healthy_model()
+    verdict = json.loads(contract.assess("base"))
+    assert verdict["status"] == "INDETERMINATE"
+    assert verdict["block_age_seconds"] is None
+    assert verdict["block_age_bucket"] == "UNKNOWN"
+    assert "2640s behind" in verdict["summary"]
+
+
+def test_assess_tolerates_skew_within_the_allowance():
+    # A fast L2 a little ahead of the clock is noise, not a stale clock. Exactly
+    # at the allowance must still clamp rather than give up.
+    contract = make_contract()
+    stub_network(
+        now=1_700_000_000,
+        l2_timestamp=1_700_000_000 + rw.CLOCK_SKEW_TOLERANCE_SECONDS,
+    )
+    healthy_model()
+    verdict = json.loads(contract.assess("base"))
+    assert verdict["status"] == "HEALTHY"
+    assert verdict["block_age_seconds"] == 0
 
 
 def test_assess_ignores_numbers_and_extra_keys_from_the_model():
@@ -882,7 +970,7 @@ def test_assess_is_indeterminate_when_the_chain_fetch_raises():
     contract = make_contract()
 
     def fake_get(url):
-        if url.startswith(rw.CLOCK_BLOCKSCOUT_URL):
+        if any(url.startswith(source) for source in rw.CLOCK_SOURCES):
             return FakeResponse(block_body(1, 1_700_000_000))
         raise RuntimeError("blockscout unreachable")
 
