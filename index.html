@@ -110,6 +110,12 @@ const CONFIG = {
   // requests/minute — ample for one reader.
   rpcUrl: "https://studio-dev.genlayer.com/api",
   chainId: 61997,
+  // npm dist-tags: latest=1.1.8 (2026-05-06), rc=2.0.0-rc.1 (2026-09-03).
+  // Studio's fee enforcement (enforce_v06_submission_config) shipped in the
+  // same window as the 2.0 RC, and 1.1.8 sends writes the consensus contract
+  // now rejects. Pinned rather than floating so a CDN change cannot silently
+  // swap the SDK under us; set to "1.1.8" to go back.
+  sdkVersion: "2.0.0-rc.1",
   explorer: "https://explorer-studio-dev.genlayer.com",
 };
 
@@ -248,9 +254,11 @@ function buildAccount(sdk, privateKey) {
 }
 
 async function connect() {
+  const base = `https://esm.sh/genlayer-js@${CONFIG.sdkVersion}`;
+  console.info(`loading genlayer-js@${CONFIG.sdkVersion}`);
   const [sdk, chains] = await Promise.all([
-    import("https://esm.sh/genlayer-js"),
-    import("https://esm.sh/genlayer-js/chains"),
+    import(base),
+    import(`${base}/chains`),
   ]);
   const key = localStorage.getItem(STORAGE_KEY) || newPrivateKey();
   const built = buildAccount(sdk, key);
