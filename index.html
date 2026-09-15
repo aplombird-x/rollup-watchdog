@@ -105,11 +105,14 @@
 
 <script type="module">
 // ---------------------------------------------------------------------------
-// CONFIG — set the address of your Studio Next (chain 61997) deployment.
+// CONFIG — your Studio Next deployment.
 // ---------------------------------------------------------------------------
 const CONFIG = {
   contract: "0x3D62e1a41552Fc38BB6c7DAC95DF94D082163F45",
-  chainId: 61997,
+  // genlayer-js identifies chains by export name, not by id: the module
+  // exports localnet, studionet, testnetAsimov, testnetBradbury. Match on the
+  // name and treat the id as a cross-check only.
+  chainExport: "studionet",
   explorer: "https://explorer-studio-dev.genlayer.com",
 };
 
@@ -139,14 +142,20 @@ document.getElementById("addr").textContent = CONFIG.contract;
 document.getElementById("explorer").href = `${CONFIG.explorer}/address/${CONFIG.contract}`;
 
 function resolveChain(chains) {
-  // Pick whichever export carries our chain id, so an SDK rename does not
-  // silently point the page at the wrong network.
-  for (const candidate of Object.values(chains)) {
-    if (candidate && Number(candidate.id) === CONFIG.chainId) return candidate;
+  const chosen = chains[CONFIG.chainExport];
+  if (chosen) {
+    console.info(`chain ${CONFIG.chainExport} -> id ${chosen.id}`);
+    return chosen;
   }
+  // Report names WITH ids: listing names alone leaves the next person guessing
+  // which one to use, which is how this failed the first time.
+  const available = Object.entries(chains)
+    .filter(([, c]) => c && c.id !== undefined)
+    .map(([name, c]) => `${name} (id ${c.id})`)
+    .join(", ");
   throw new Error(
-    `genlayer-js/chains has no chain with id ${CONFIG.chainId}. ` +
-    `Available exports: ${Object.keys(chains).join(", ")}`
+    `genlayer-js/chains has no export named "${CONFIG.chainExport}". ` +
+    `Available: ${available || Object.keys(chains).join(", ")}`
   );
 }
 
@@ -193,12 +202,13 @@ async function connect(privateKey) {
   // a bad paste would strand an account the user had already funded.
   if (built) localStorage.setItem(STORAGE_KEY, key);
   account = built;
+  // Paint the account before resolving the chain: if chain lookup fails the
+  // user should still see (and be able to fund) their address.
+  showAccount();
   // Without a usable account the page still reads verdicts; only writes need
   // one, so degrade rather than failing the whole page.
-  client = sdk.createClient(
-    account ? { chain: resolveChain(chains), account } : { chain: resolveChain(chains) }
-  );
-  showAccount();
+  const chain = resolveChain(chains);
+  client = sdk.createClient(account ? { chain, account } : { chain });
   return Boolean(account);
 }
 
