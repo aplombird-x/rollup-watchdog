@@ -356,9 +356,19 @@ async function runAssessment(chainId) {
       fees: { distribution: estimate.distribution, feeValue: estimate.feeValue },
     });
 
-    say(`Transaction ${hash} submitted. Waiting for consensus…`);
-    const receipt = await client.waitForFinalization({ hash });
-    // Reaching finalized does not prove the execution succeeded, so ask.
+    say(`Transaction ${hash} submitted. Waiting for consensus (up to ~1 min)…`);
+    // waitForDecision, not waitForFinalization: the verdict is stored once the
+    // decision materialises. Finalization additionally waits for fee
+    // settlement and refunds, which this page does not need.
+    //
+    // Poll explicitly rather than relying on SDK defaults: an assessment runs
+    // five validators, each making three fetches and an LLM call, so it takes
+    // ~30-60s. The documented Python default (3s x 10 = 30s) would often
+    // expire first. 3s x 100 gives five minutes.
+    const receipt = await client.waitForDecision({
+      hash, interval: 3_000, retries: 100,
+    });
+    // A decision is not proof of successful execution, so ask.
     if (sdkIsSuccessful && !sdkIsSuccessful(receipt)) {
       throw new Error(
         `${receipt?.statusName ?? "finalized"} / ` +
