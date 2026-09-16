@@ -183,9 +183,8 @@ once per execution, and both stored and returned, so the match is exact. The
 tally is reported as cast (`3/5 agreed · 2 idle`), never rounded up to 5/5:
 idle validators did not agree. A failed call means no votes, nothing worse.
 
-Those votes come from the RPC, not the explorer. The link goes to the
-contract's address page rather than the individual transaction, because the
-explorer's `/tx/` route 404s even for hashes its own address page lists.
+Those votes come from the RPC, not the explorer; the link goes to the round
+itself so anyone can check them independently.
 
 The page defines its own chain rather than using a bundled one. Each Studio
 instance has a distinct chain id — **dev 61997, staging 61998, production
