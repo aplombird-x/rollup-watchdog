@@ -138,11 +138,14 @@ const el = {
 document.getElementById("addr").textContent = CONFIG.contract;
 document.getElementById("explorer").href = `${CONFIG.explorer}/address/${CONFIG.contract}`;
 
-function studioNextChain(sdk, chains) {
+// `networks` is the genlayer-js/chains module: GenLayer's own networks
+// (localnet, studionet, testnet*), not the L2s this oracle watches.
+function studioNextChain(sdk, networks) {
   // Start from the production export so SDK-specific fields carry over, then
   // override everything instance-specific.
-  const template = chains.studionet ?? Object.values(chains).find(Boolean) ?? {};
+  const template = networks.studionet ?? Object.values(networks).find(Boolean) ?? {};
   const definition = {
+    nativeCurrency: { name: "GEN", symbol: "GEN", decimals: 18 },
     ...template,
     id: CONFIG.chainId,
     name: "GenLayer Studio Next",
@@ -181,7 +184,6 @@ async function refreshBalance() {
     const funded = wei > 0n;
     balance.textContent = `Balance: ${formatGen(wei)}${funded ? "" : " — fund before assessing"}`;
     balance.className = funded ? "hint" : "hint warn";
-    return wei;
   } catch (error) {
     balance.textContent = `Balance unavailable: ${error.message}`;
     balance.className = "hint warn";
@@ -234,13 +236,38 @@ function buildAccount(sdk, privateKey) {
   return null;
 }
 
+// From a CDN, so this stays a static file with no build step. esm.sh builds
+// dependency chunks on demand and those builds sometimes time out (Cloudflare
+// 524) even when the entry point is cached, which blanks the page. ?bundle
+// inlines every dependency into one file, so there are no leaf chunks to fail;
+// the plain URL is the fallback.
+function sdkUrls(path) {
+  const pkg = `https://esm.sh/genlayer-js@${CONFIG.sdkVersion}${path}`;
+  return [`${pkg}?bundle&target=es2022`, pkg];
+}
+
+async function importFirst(urls, label) {
+  const failures = [];
+  for (const url of urls) {
+    try {
+      const mod = await import(url);
+      console.info(`${label} loaded from ${url}`);
+      return mod;
+    } catch (error) {
+      failures.push(`  ${url}\n    ${error.message}`);
+    }
+  }
+  throw new Error(`could not load ${label}:\n${failures.join("\n")}`);
+}
+
 async function connect() {
-  // From a CDN, so this stays a single static file with no build step.
-  const base = `https://esm.sh/genlayer-js@${CONFIG.sdkVersion}`;
-  console.info(`loading genlayer-js@${CONFIG.sdkVersion}`);
-  const [sdk, chains] = await Promise.all([
-    import(base),
-    import(`${base}/chains`),
+  const [sdk, networks] = await Promise.all([
+    importFirst(sdkUrls(""), "genlayer-js"),
+    // Only a template; without it studioNextChain defines the network itself.
+    importFirst(sdkUrls("/chains"), "genlayer-js/chains").catch((error) => {
+      console.warn("genlayer-js/chains unavailable:", error.message);
+      return {};
+    }),
   ]);
   sdkIsSuccessful = sdk.isSuccessful;
   const key = localStorage.getItem(STORAGE_KEY) || newPrivateKey();
@@ -254,7 +281,7 @@ async function connect() {
   // Paint the account before building the client: if that fails the user
   // should still see, and be able to fund, their address.
   showAccount();
-  const chain = studioNextChain(sdk, chains);
+  const chain = studioNextChain(sdk, networks);
   // Reads need no account, so a client without one is still useful.
   client = sdk.createClient(account ? { chain, account } : { chain });
   say(`Connected to ${CONFIG.rpcUrl} (chain ${CONFIG.chainId}).`);
@@ -416,7 +443,7 @@ async function readVerdict(chainId, txHash) {
 }
 
 async function runAssessment(chainId) {
-  el.run.disabled = el.refresh.disabled = true;
+  el.run.disabled = el.refresh.disabled = el.chain.disabled = true;
   try {
     const write = {
       address: CONFIG.contract,
@@ -464,7 +491,7 @@ async function runAssessment(chainId) {
       : "";
     say(`Assessment failed: ${detail}${hint}`, true);
   } finally {
-    el.run.disabled = el.refresh.disabled = false;
+    el.run.disabled = el.refresh.disabled = el.chain.disabled = false;
   }
 }
 
@@ -476,15 +503,17 @@ document.getElementById("copy").addEventListener("click", () => {
 });
 
 el.run.addEventListener("click", () => runAssessment(el.chain.value));
-el.refresh.addEventListener("click", () =>
+// Refresh the history first: the chain may have votes this page has not seen.
+const reload = () =>
   refreshAssessments()
     .then(() => readVerdict(el.chain.value))
-    .catch((e) => say(`Read failed: ${e?.message ?? e}`, true)));
-el.chain.addEventListener("change", () =>
-  // Refresh first: a chain switched to may have votes this page has not seen.
-  refreshAssessments()
-    .then(() => readVerdict(el.chain.value))
-    .catch(() => render(null)));
+    .catch((e) => {
+      render(null);   // never leave another chain's verdict on screen
+      say(`Read failed: ${e?.message ?? e}`, true);
+    });
+
+el.refresh.addEventListener("click", reload);
+el.chain.addEventListener("change", reload);
 
 (async function start() {
   try {
