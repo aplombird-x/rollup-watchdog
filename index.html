@@ -39,6 +39,7 @@
   .DEGRADED .dot { background: var(--degraded); } .DEGRADED .status { color: var(--degraded); }
   .HALTED .dot { background: var(--halted); } .HALTED .status { color: var(--halted); }
   .INDETERMINATE .dot { background: var(--unknown); } .INDETERMINATE .status { color: var(--unknown); }
+  .assessed { margin: 4px 0 10px; font-size: 13px; color: var(--muted); }
   .summary { margin: 0 0 14px; }
   .evidence { margin: 14px 0 0; font-size: 14px; }
   .evidence a { color: var(--accent); }
@@ -86,6 +87,7 @@
 
   <div class="panel" id="verdict" hidden>
     <div class="verdict-head"><span class="dot"></span><span class="status"></span></div>
+    <p class="assessed"></p>
     <p class="summary"></p>
     <div class="facts"></div>
     <p class="evidence"></p>
@@ -339,6 +341,18 @@ function describeVotes(tally) {
   return `${tally.agree ?? 0}/${total} agreed` + (rest ? ` · ${rest}` : "");
 }
 
+// "41741s ago" is not a readable answer to "how old is this?".
+function humanAge(seconds) {
+  if (seconds < 10) return "just now";
+  if (seconds < 60) return `${seconds}s ago`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+  const unit = seconds < 86400 ? 3600 : 86400;
+  const big = Math.floor(seconds / unit);
+  const small = Math.floor((seconds % unit) / (unit / 60));
+  const [a, b] = unit === 3600 ? ["h", "m"] : ["d", "h"];
+  return small ? `${big}${a} ${small}${b} ago` : `${big}${a} ago`;
+}
+
 function render(json, txHash) {
   if (!json) {
     el.verdict.hidden = true;
@@ -357,6 +371,18 @@ function render(json, txHash) {
   const ageSeconds = Math.max(0, -skew);
   const clockOff = skew > 120;
   const stale = ageSeconds > 600;
+
+  // Every figure in this panel describes the moment of assessment except this
+  // one, which is relative to now. Keeping it out of the tile row and stating
+  // what it governs stops "produced 5 seconds ago" from reading as "5 seconds
+  // before you loaded the page".
+  const when = new Date(v.assessed_at_unix * 1000)
+    .toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
+  el.verdict.querySelector(".assessed").innerHTML = clockOff
+    ? '<span class="stale">Dated in the future — this device\'s clock is behind.</span>'
+    : `<span class="${stale ? "stale" : ""}">Assessed ${humanAge(ageSeconds)}</span>` +
+      ` · ${when} · the figures below are from that moment`;
+
   const fact = (label, value, cls = "") =>
     `<div class="fact"><b>${label}</b><span class="${cls}">${value}</span></div>`;
 
@@ -364,13 +390,6 @@ function render(json, txHash) {
     fact("Latest block", v.block_number ?? "unknown"),
     fact("Block age", v.block_age_seconds === null ? "unknown" : `${v.block_age_seconds}s`),
     fact("Age bucket", v.block_age_bucket),
-    // Staleness is the number a consumer must not ignore: a HEALTHY verdict
-    // from an hour ago says nothing about the chain right now.
-    fact(
-      "Verdict age",
-      clockOff ? "device clock is behind" : `${ageSeconds}s ago`,
-      clockOff || stale ? "stale" : "",
-    ),
   ].join("");
 
   // txHash covers an assessment just run, whose transaction may not be listed
