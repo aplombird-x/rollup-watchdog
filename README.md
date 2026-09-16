@@ -17,6 +17,11 @@ minutes could be an outage or a quiet hour. An LLM weighing block freshness
 against the official status page makes that call better than a threshold alert,
 and validator consensus makes it trustless — which is what GenLayer is for.
 
+Generic uptime monitors watch APIs and infrastructure. RollupWatchdog is
+**L2-native**: it reasons about sequencer liveness, block-production freshness,
+and official chain status channels — signals, failure modes, and consumers
+(bridges, wallets) that generic infra monitoring doesn't cover.
+
 ## How it works
 
 1. Anyone calls `assess(chain_id)`.
@@ -35,6 +40,14 @@ and validator consensus makes it trustless — which is what GenLayer is for.
 
 Chains are configured at deploy time, so this is a reusable oracle framework
 rather than a hardcoded demo; more can be added via owner-only `add_chain`.
+
+## Repo layout
+
+```
+rollup_watchdog.py         # the Intelligent Contract (single file, GenVM)
+test_rollup_watchdog.py    # off-chain tests (stubbed SDK, no dependencies)
+index.html                 # dashboard (single static file, no build step)
+```
 
 ## Design decisions
 
@@ -163,6 +176,15 @@ consensus contract rejects a zero fee, so the estimate is not optional. Note
 that finalized does not imply succeeded — hence the `isSuccessful` check. The
 SDK is pinned to `2.0.0-rc.1`; npm's `latest` (1.1.8) predates this fee model.
 
+Every verdict shows how the validators voted and links to that consensus on
+the explorer. The contract stores no transaction hash — it cannot see its own —
+so the page lists the contract's assessments via
+`sim_getTransactionsForAddress` and matches on `assessed_at_unix`, which is
+generated once per execution and is both stored and returned, making the match
+exact. The tally is reported as cast (`3/5 agreed · 2 idle`), never rounded up
+to 5/5: idle validators did not agree. If the call fails the verdict simply
+carries no link.
+
 The page defines its own chain rather than using a bundled one. Each Studio
 instance has a distinct chain id — **dev 61997, staging 61998, production
 61999** — and `genlayer-js` ships `studionet` pointing at production, so it
@@ -253,9 +275,22 @@ Confirmed on **Studio Next** (chain 61997). Every transaction reached
 - **The clock fix, measured** — `assess("base")` `0x9b2fac72…6a2c75` stamped
   `assessed_at_unix` at 22:10:00Z, the same second the transaction was created.
   `eth.blockscout.com` was 44–59 minutes behind that day, so a single-source
-  clock would have stamped it ~45 minutes stale and clamped any real block age
-  to `0`. Two sources, later reading wins, and the clock is current. This also
-  confirms GenVM follows the gnosis redirect from inside validators.
+  clock would have stamped it ~45 minutes stale. It also confirms GenVM follows
+  the gnosis redirect from inside validators.
+- **A measured block age** — `assess("zksync-era")` returned `HEALTHY` with
+  `block_age_seconds: 15` on block 71998859, and the verdict cited it: *"the
+  latest block … arriving just 15 seconds ago."* Under the old single-clock
+  code this read `0` for every chain, because the stale clock drove the age
+  negative and `max(0, …)` hid it. Fifteen seconds is evidence; zero was not.
+  The same verdict noted *"No status page was available for this chain"*, so
+  the missing-signal rule holds on this deployment too.
+- **Granularity, not the bug** — `assess("arbitrum-one")` on the same
+  deployment minutes later returned `block_age_seconds: 0`. That is correct:
+  Arbitrum produces ~4 blocks/second, so its newest block is younger than the
+  clock's own newest block and the age clamps. The verdict age on that read was
+  27s, which proves the clock was current — a stale clock would have shown
+  ~2700s. Two chains, one clock, different answers because they produce blocks
+  at different rates.
 
 Earlier runs on the previous deployment (`0x3D62e1a4…163F45`) established the
 rest, though their `block_age_seconds: 0` is the old clamp hiding that lagging
@@ -324,21 +359,6 @@ Two lessons came from reading live verdicts rather than from tests:
   data as the price of a narrow injection surface.
 - **Validators can disagree about whether a status page is reachable**, which
   remains a source of minority disagreement.
-
-## Repo layout
-
-```
-rollup_watchdog.py         # the Intelligent Contract (single file, GenVM)
-test_rollup_watchdog.py    # off-chain tests (stubbed SDK, no dependencies)
-index.html                 # dashboard (single static file, no build step)
-```
-
-## Differentiation
-
-Generic uptime monitors watch APIs and infrastructure. RollupWatchdog is
-**L2-native**: it reasons about sequencer liveness, block-production freshness,
-and official chain status channels — signals, failure modes, and consumers
-(bridges, wallets) that generic infra monitoring doesn't cover.
 
 ## Roadmap
 
