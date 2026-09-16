@@ -351,7 +351,7 @@ function humanAge(seconds) {
   return small ? `${big}${a} ${small}${b} ago` : `${big}${a} ago`;
 }
 
-function render(json) {
+function render(json, txHash) {
   if (!json) {
     el.verdict.hidden = true;
     return;
@@ -388,19 +388,20 @@ function render(json) {
     fact("Age bucket", v.block_age_bucket),
   ].join("");
 
-  // The votes come from sim_getTransactionsForAddress and are shown here; the
-  // explorer's own /tx/ route 404s, so link to the contract's address page,
-  // which lists every assessment.
+  // Votes come from sim_getTransactionsForAddress; the link goes to the round
+  // itself. txHash covers an assessment just run, whose transaction may not be
+  // listed yet.
   const match = assessments.find((a) => a.assessedAt === v.assessed_at_unix);
+  const hash = match?.hash ?? txHash;
   const votes = match ? describeVotes(match.tally) : "";
-  el.verdict.querySelector(".evidence").innerHTML = votes
-    ? `${votes} · ` +
-      `<a href="${CONFIG.explorer}/address/${CONFIG.contract}" target="_blank" rel="noreferrer">` +
-      "All assessments on the explorer &rarr;</a>"
+  el.verdict.querySelector(".evidence").innerHTML = hash
+    ? `${votes ? `${votes} · ` : ""}` +
+      `<a href="${CONFIG.explorer}/tx/${hash}" target="_blank" rel="noreferrer">` +
+      "See how the validators voted &rarr;</a>"
     : "";
 }
 
-async function readVerdict(chainId) {
+async function readVerdict(chainId, txHash) {
   say(`Reading stored verdict for ${chainId}…`);
   const stored = await client.readContract({
     address: CONFIG.contract, functionName: "get_assessment", args: [chainId],
@@ -410,7 +411,7 @@ async function readVerdict(chainId) {
     say(`No verdict stored yet for ${chainId}. Run an assessment to create one.`);
     return;
   }
-  render(stored);
+  render(stored, txHash);
   say(`Latest consensus verdict for ${chainsById[chainId]?.name ?? chainId}.`);
 }
 
@@ -452,7 +453,7 @@ async function runAssessment(chainId) {
     }
     say(`Consensus reached. Transaction ${hash}`);
     await refreshAssessments();
-    await readVerdict(chainId);
+    await readVerdict(chainId, hash);
   } catch (error) {
     // An unfunded account and the 60s throttle are both expected; name them.
     const detail = String(error?.message ?? error);
