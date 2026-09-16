@@ -176,14 +176,16 @@ consensus contract rejects a zero fee, so the estimate is not optional. Note
 that finalized does not imply succeeded — hence the `isSuccessful` check. The
 SDK is pinned to `2.0.0-rc.1`; npm's `latest` (1.1.8) predates this fee model.
 
-Every verdict shows how the validators voted and links to that consensus on
-the explorer. The contract stores no transaction hash — it cannot see its own —
-so the page lists the contract's assessments via
-`sim_getTransactionsForAddress` and matches on `assessed_at_unix`, which is
-generated once per execution and is both stored and returned, making the match
-exact. The tally is reported as cast (`3/5 agreed · 2 idle`), never rounded up
-to 5/5: idle validators did not agree. If the call fails the verdict simply
-carries no link.
+Every verdict shows how the validators voted. The contract cannot see its own
+transaction hash, so the page lists the contract's assessments via
+`sim_getTransactionsForAddress` and matches on `assessed_at_unix` — generated
+once per execution, and both stored and returned, so the match is exact. The
+tally is reported as cast (`3/5 agreed · 2 idle`), never rounded up to 5/5:
+idle validators did not agree. A failed call means no votes, nothing worse.
+
+Those votes come from the RPC, not the explorer. The link goes to the
+contract's address page rather than the individual transaction, because the
+explorer's `/tx/` route 404s even for hashes its own address page lists.
 
 The page defines its own chain rather than using a bundled one. Each Studio
 instance has a distinct chain id — **dev 61997, staging 61998, production
