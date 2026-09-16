@@ -297,10 +297,8 @@ async function loadChains() {
   return configured;
 }
 
-// A verdict does not say which transaction produced it -- the contract cannot
-// record its own hash. sim_getTransactionsForAddress lists every assessment of
-// this contract together with the verdict it returned, and assessed_at_unix is
-// generated once per execution, so matching on it is exact.
+// A verdict carries no transaction hash, so match it to its round by
+// assessed_at_unix, which is generated once per execution.
 let assessments = [];
 
 async function refreshAssessments() {
@@ -310,7 +308,7 @@ async function refreshAssessments() {
       if (tx.status !== "FINALIZED" || !tx.result) return [];
       let verdict;
       try {
-        // Sometimes a string, sometimes already parsed; both occur.
+        // Observed as both a JSON string and an object across deployments.
         verdict = typeof tx.result === "string" ? JSON.parse(tx.result) : tx.result;
       } catch {
         return [];
@@ -323,7 +321,7 @@ async function refreshAssessments() {
       return [{ hash: tx.hash, assessedAt: verdict.assessed_at_unix, tally }];
     });
   } catch (error) {
-    // Additive only: without the history a verdict simply carries no link.
+    // Additive only: without the history a verdict shows no votes.
     console.warn("assessment history unavailable:", error);
     assessments = [];
   }
@@ -353,7 +351,7 @@ function humanAge(seconds) {
   return small ? `${big}${a} ${small}${b} ago` : `${big}${a} ago`;
 }
 
-function render(json, txHash) {
+function render(json) {
   if (!json) {
     el.verdict.hidden = true;
     return;
@@ -372,10 +370,8 @@ function render(json, txHash) {
   const clockOff = skew > 120;
   const stale = ageSeconds > 600;
 
-  // Every figure in this panel describes the moment of assessment except this
-  // one, which is relative to now. Keeping it out of the tile row and stating
-  // what it governs stops "produced 5 seconds ago" from reading as "5 seconds
-  // before you loaded the page".
+  // Every figure below is from the assessment; only this line is relative to
+  // now. Stating that stops "produced 5 seconds ago" reading as "before load".
   const when = new Date(v.assessed_at_unix * 1000)
     .toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
   el.verdict.querySelector(".assessed").innerHTML = clockOff
@@ -392,19 +388,19 @@ function render(json, txHash) {
     fact("Age bucket", v.block_age_bucket),
   ].join("");
 
-  // txHash covers an assessment just run, whose transaction may not be listed
-  // yet; every other verdict is found by matching the history.
+  // The votes come from sim_getTransactionsForAddress and are shown here; the
+  // explorer's own /tx/ route 404s, so link to the contract's address page,
+  // which lists every assessment.
   const match = assessments.find((a) => a.assessedAt === v.assessed_at_unix);
-  const hash = match?.hash ?? txHash;
   const votes = match ? describeVotes(match.tally) : "";
-  el.verdict.querySelector(".evidence").innerHTML = hash
-    ? `${votes ? `${votes} · ` : ""}` +
-      `<a href="${CONFIG.explorer}/tx/${hash}" target="_blank" rel="noreferrer">` +
-      "See how the validators voted &rarr;</a>"
+  el.verdict.querySelector(".evidence").innerHTML = votes
+    ? `${votes} · ` +
+      `<a href="${CONFIG.explorer}/address/${CONFIG.contract}" target="_blank" rel="noreferrer">` +
+      "All assessments on the explorer &rarr;</a>"
     : "";
 }
 
-async function readVerdict(chainId, txHash) {
+async function readVerdict(chainId) {
   say(`Reading stored verdict for ${chainId}…`);
   const stored = await client.readContract({
     address: CONFIG.contract, functionName: "get_assessment", args: [chainId],
@@ -414,7 +410,7 @@ async function readVerdict(chainId, txHash) {
     say(`No verdict stored yet for ${chainId}. Run an assessment to create one.`);
     return;
   }
-  render(stored, txHash);
+  render(stored);
   say(`Latest consensus verdict for ${chainsById[chainId]?.name ?? chainId}.`);
 }
 
@@ -441,13 +437,9 @@ async function runAssessment(chainId) {
 
     say(`Transaction ${hash} submitted. Waiting for consensus — this can take a few minutes…`);
     // waitForDecision, not waitForFinalization: the verdict is stored once the
-    // decision materialises. Finalization additionally waits for fee
-    // settlement and refunds, which this page does not need.
-    //
-    // Poll explicitly rather than relying on SDK defaults: an assessment runs
-    // five validators, each making up to four fetches and an LLM call. The
-    // documented Python default (3s x 10 = 30s) would often expire first;
-    // 3s x 100 gives five minutes.
+    // decision lands; finalization also waits for fee settlement.
+    // Five minutes, not the SDK's 30s default — five validators each make up
+    // to four fetches and an LLM call.
     const receipt = await client.waitForDecision({
       hash, interval: 3_000, retries: 100,
     });
@@ -460,7 +452,7 @@ async function runAssessment(chainId) {
     }
     say(`Consensus reached. Transaction ${hash}`);
     await refreshAssessments();
-    await readVerdict(chainId, hash);
+    await readVerdict(chainId);
   } catch (error) {
     // An unfunded account and the 60s throttle are both expected; name them.
     const detail = String(error?.message ?? error);
@@ -487,13 +479,14 @@ el.refresh.addEventListener("click", () =>
   refreshAssessments()
     .then(() => readVerdict(el.chain.value))
     .catch((e) => say(`Read failed: ${e?.message ?? e}`, true)));
-el.chain.addEventListener("change", () => readVerdict(el.chain.value).catch(() => render(null)));
+el.chain.addEventListener("change", () =>
+  // Refresh first: a chain switched to may have votes this page has not seen.
+  refreshAssessments()
+    .then(() => readVerdict(el.chain.value))
+    .catch(() => render(null)));
 
 (async function start() {
   try {
-    if (CONFIG.contract.startsWith("0xPASTE")) {
-      throw new Error("Set CONFIG.contract to your Studio Next deployment address.");
-    }
     const usable = await connect();
     const configured = await loadChains();
     // Reads never need an account; only the write button depends on one.
