@@ -201,8 +201,11 @@ only — a key in `localStorage` is readable by any script on the origin.
 
 The chain list comes from `list_chains()` rather than being hardcoded, so the
 page reflects the actual deployment and labels each chain one-signal or two.
-The verdict panel shows the traffic light, the AI-written reason, the measured
-numbers, and how old the verdict is.
+The verdict panel shows the traffic light, the AI-written reason, and the
+measured numbers. A stored verdict describes a past moment, so the panel is
+headed with when it was assessed and says the figures below belong to that
+moment — otherwise "the latest block was produced 5 seconds ago" reads as five
+seconds before page load, when it may be hours old.
 
 ## Tests
 
