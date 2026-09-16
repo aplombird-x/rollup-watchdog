@@ -116,7 +116,6 @@ const CONFIG = {
   explorer: "https://explorer-studio-dev.genlayer.com",
 };
 
-// Loaded from a CDN so this stays a single static file with no build step.
 // Errors are surfaced verbatim rather than swallowed.
 const log = document.getElementById("log");
 const say = (msg, isError = false) => {
@@ -137,8 +136,6 @@ const el = {
 document.getElementById("addr").textContent = CONFIG.contract;
 document.getElementById("explorer").href = `${CONFIG.explorer}/address/${CONFIG.contract}`;
 
-// genlayer-js bundles `studionet` (production, id 61999) but nothing for the
-// dev instance, so the chain is defined here instead of looked up.
 function studioNextChain(sdk, chains) {
   // Start from the production export so SDK-specific fields carry over, then
   // override everything instance-specific.
@@ -236,6 +233,7 @@ function buildAccount(sdk, privateKey) {
 }
 
 async function connect() {
+  // From a CDN, so this stays a single static file with no build step.
   const base = `https://esm.sh/genlayer-js@${CONFIG.sdkVersion}`;
   console.info(`loading genlayer-js@${CONFIG.sdkVersion}`);
   const [sdk, chains] = await Promise.all([
@@ -251,12 +249,11 @@ async function connect() {
     localStorage.setItem(STORAGE_KEY, key);
     account = built;
   }
-  // Paint the account before touching the network: if the connection fails the
-  // user should still see (and be able to fund) their address.
+  // Paint the account before building the client: if that fails the user
+  // should still see, and be able to fund, their address.
   showAccount();
-  // Without a usable account the page still reads verdicts; only writes need
-  // one, so degrade rather than failing the whole page.
   const chain = studioNextChain(sdk, chains);
+  // Reads need no account, so a client without one is still useful.
   client = sdk.createClient(account ? { chain, account } : { chain });
   say(`Connected to ${CONFIG.rpcUrl} (chain ${CONFIG.chainId}).`);
   // No verification read here: loadChains() runs next and fails just as
@@ -298,6 +295,50 @@ async function loadChains() {
   return configured;
 }
 
+// A verdict does not say which transaction produced it -- the contract cannot
+// record its own hash. sim_getTransactionsForAddress lists every assessment of
+// this contract together with the verdict it returned, and assessed_at_unix is
+// generated once per execution, so matching on it is exact.
+let assessments = [];
+
+async function refreshAssessments() {
+  try {
+    const list = await rpc("sim_getTransactionsForAddress", [CONFIG.contract]);
+    assessments = (list ?? []).flatMap((tx) => {
+      if (tx.status !== "FINALIZED" || !tx.result) return [];
+      let verdict;
+      try {
+        // Sometimes a string, sometimes already parsed; both occur.
+        verdict = typeof tx.result === "string" ? JSON.parse(tx.result) : tx.result;
+      } catch {
+        return [];
+      }
+      if (typeof verdict?.assessed_at_unix !== "number") return [];
+      const tally = {};
+      for (const vote of Object.values(tx.consensus_data?.votes ?? {})) {
+        tally[vote] = (tally[vote] ?? 0) + 1;
+      }
+      return [{ hash: tx.hash, assessedAt: verdict.assessed_at_unix, tally }];
+    });
+  } catch (error) {
+    // Additive only: without the history a verdict simply carries no link.
+    console.warn("assessment history unavailable:", error);
+    assessments = [];
+  }
+}
+
+// Report votes as cast: idle validators did not agree, so a bare "5/5" would
+// overstate the round.
+function describeVotes(tally) {
+  const total = Object.values(tally).reduce((sum, n) => sum + n, 0);
+  if (!total) return "";
+  const rest = Object.entries(tally)
+    .filter(([vote]) => vote !== "agree")
+    .map(([vote, n]) => `${n} ${vote}`)
+    .join(", ");
+  return `${tally.agree ?? 0}/${total} agreed` + (rest ? ` · ${rest}` : "");
+}
+
 function render(json, txHash) {
   if (!json) {
     el.verdict.hidden = true;
@@ -332,14 +373,16 @@ function render(json, txHash) {
     ),
   ].join("");
 
-  // The validator set, their votes and any rotations are the evidence behind
-  // the verdict, and they live on the explorer. A stored verdict carries no
-  // transaction hash, so fall back to the contract's whole history.
-  const link = (href, text) =>
-    `<a href="${href}" target="_blank" rel="noreferrer">${text} &rarr;</a>`;
-  el.verdict.querySelector(".evidence").innerHTML = txHash
-    ? link(`${CONFIG.explorer}/tx/${txHash}`, "See how the validators voted")
-    : link(`${CONFIG.explorer}/address/${CONFIG.contract}`, "See every assessment on the explorer");
+  // txHash covers an assessment just run, whose transaction may not be listed
+  // yet; every other verdict is found by matching the history.
+  const match = assessments.find((a) => a.assessedAt === v.assessed_at_unix);
+  const hash = match?.hash ?? txHash;
+  const votes = match ? describeVotes(match.tally) : "";
+  el.verdict.querySelector(".evidence").innerHTML = hash
+    ? `${votes ? `${votes} · ` : ""}` +
+      `<a href="${CONFIG.explorer}/tx/${hash}" target="_blank" rel="noreferrer">` +
+      "See how the validators voted &rarr;</a>"
+    : "";
 }
 
 async function readVerdict(chainId, txHash) {
@@ -397,6 +440,7 @@ async function runAssessment(chainId) {
       );
     }
     say(`Consensus reached. Transaction ${hash}`);
+    await refreshAssessments();
     await readVerdict(chainId, hash);
   } catch (error) {
     // An unfunded account and the 60s throttle are both expected; name them.
@@ -420,8 +464,10 @@ document.getElementById("copy").addEventListener("click", () => {
 });
 
 el.run.addEventListener("click", () => runAssessment(el.chain.value));
-el.refresh.addEventListener("click", () => readVerdict(el.chain.value).catch(
-  (e) => say(`Read failed: ${e?.message ?? e}`, true)));
+el.refresh.addEventListener("click", () =>
+  refreshAssessments()
+    .then(() => readVerdict(el.chain.value))
+    .catch((e) => say(`Read failed: ${e?.message ?? e}`, true)));
 el.chain.addEventListener("change", () => readVerdict(el.chain.value).catch(() => render(null)));
 
 (async function start() {
@@ -434,6 +480,7 @@ el.chain.addEventListener("change", () => readVerdict(el.chain.value).catch(() =
     // Reads never need an account; only the write button depends on one.
     el.refresh.disabled = false;
     el.run.disabled = !usable;
+    await refreshAssessments();
     await readVerdict(configured[0].id);
   } catch (error) {
     say(`Could not connect: ${error?.message ?? error}`, true);
