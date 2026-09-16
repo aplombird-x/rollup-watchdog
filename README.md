@@ -163,7 +163,12 @@ namespace, ran on Bradbury testnet at
 ## Dashboard
 
 `index.html` is the entire frontend — one static file loading `genlayer-js`
-from a CDN, so there is no build step and no `node_modules`.
+from a CDN, so there is no build step and no `node_modules`. It requests the
+`?bundle` build first: the plain build pulls 18 dependency chunks that esm.sh
+compiles on demand, and a cold compile can return HTTP 524 and blank the page.
+The bundled build is one self-contained file, so there are no chunks to fail.
+The plain URL is the fallback, and the optional `chains` module degrades to a
+locally defined chain.
 
 `CONFIG.contract` at the top of the script block already points at the live
 deployment — change it only if you deploy your own. Serve locally with
