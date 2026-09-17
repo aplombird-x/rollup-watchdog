@@ -101,9 +101,7 @@
 </main>
 
 <script type="module">
-// ---------------------------------------------------------------------------
-// CONFIG — your Studio Next deployment.
-// ---------------------------------------------------------------------------
+// Your Studio Next deployment.
 const CONFIG = {
   contract: "0x9bB01d8B136527698f6196a28aD657e8800E22B7",
   // Each Studio instance has its own chain id (dev 61997, staging 61998,
@@ -236,11 +234,10 @@ function buildAccount(sdk, privateKey) {
   return null;
 }
 
-// From a CDN, so this stays a static file with no build step. esm.sh builds
-// dependency chunks on demand and those builds sometimes time out (Cloudflare
-// 524) even when the entry point is cached, which blanks the page. ?bundle
-// inlines every dependency into one file, so there are no leaf chunks to fail;
-// the plain URL is the fallback.
+// A CDN keeps this a single static file with no build step. The plain build
+// pulls 18 dependency chunks that esm.sh compiles on demand, and a cold
+// compile can time out (HTTP 524) and blank the page; ?bundle inlines them
+// into one file. The plain URL stays as the fallback.
 function sdkUrls(path) {
   const pkg = `https://esm.sh/genlayer-js@${CONFIG.sdkVersion}${path}`;
   return [`${pkg}?bundle&target=es2022`, pkg];
@@ -285,8 +282,7 @@ async function connect() {
   // Reads need no account, so a client without one is still useful.
   client = sdk.createClient(account ? { chain, account } : { chain });
   say(`Connected to ${CONFIG.rpcUrl} (chain ${CONFIG.chainId}).`);
-  // No verification read here: loadChains() runs next and fails just as
-  // clearly, and duplicating it would double every page load's RPC cost.
+  // No verification read: loadChains() runs next and fails just as clearly.
   return Boolean(account);
 }
 
@@ -328,11 +324,13 @@ async function loadChains() {
 // assessed_at_unix, which is generated once per execution.
 let assessments = [];
 
-async function refreshAssessments() {
+async function readAssessments() {
   try {
     const list = await rpc("sim_getTransactionsForAddress", [CONFIG.contract]);
     assessments = (list ?? []).flatMap((tx) => {
-      if (tx.status !== "FINALIZED" || !tx.result) return [];
+      // Accept a decided round, not only a finalized one: waitForDecision
+      // returns before finalization.
+      if (!/^(ACCEPTED|FINALIZED)$/i.test(tx.status ?? "") || !tx.result) return [];
       let verdict;
       try {
         // Observed as both a JSON string and an object across deployments.
@@ -351,6 +349,22 @@ async function refreshAssessments() {
     // Additive only: without the history a verdict shows no votes.
     console.warn("assessment history unavailable:", error);
     assessments = [];
+  }
+}
+
+// The transaction list lags a write by a moment, so a just-run assessment can
+// be missing from it. Poll until `hash` appears rather than rendering the fresh
+// verdict with no vote tally. Called without a hash, this is a plain refresh.
+const LIST_POLL_INTERVAL_MS = 1_500;
+const LIST_POLL_WINDOW_MS = 10_000;
+
+async function refreshAssessments(hash) {
+  const attempts = Math.ceil(LIST_POLL_WINDOW_MS / LIST_POLL_INTERVAL_MS);
+  for (let attempt = 0; ; attempt++) {
+    await readAssessments();
+    if (!hash || attempt === attempts) return;
+    if (assessments.some((a) => a.hash === hash)) return;
+    await new Promise((resolve) => setTimeout(resolve, LIST_POLL_INTERVAL_MS));
   }
 }
 
@@ -389,9 +403,9 @@ function render(json, txHash) {
   el.verdict.querySelector(".status").textContent = v.status;
   el.verdict.querySelector(".summary").textContent = v.summary;
 
-  // Date.now() is epoch-based, so this is right in every timezone -- but it
-  // trusts the device clock. A verdict dated in the future means that clock is
-  // behind; say so rather than clamp it to 0 and imply the verdict is fresh.
+  // Date.now() is epoch-based, so this is right in every timezone — but it
+  // trusts the device clock. A future-dated verdict means that clock is behind;
+  // say so rather than clamp to 0 and imply the verdict is fresh.
   const skew = v.assessed_at_unix - Math.floor(Date.now() / 1000);
   const ageSeconds = Math.max(0, -skew);
   const clockOff = skew > 120;
@@ -415,9 +429,8 @@ function render(json, txHash) {
     fact("Age bucket", v.block_age_bucket),
   ].join("");
 
-  // Votes come from sim_getTransactionsForAddress; the link goes to the round
-  // itself. txHash covers an assessment just run, whose transaction may not be
-  // listed yet.
+  // Votes come from the RPC list; txHash covers an assessment just run, whose
+  // transaction may not be listed there yet.
   const match = assessments.find((a) => a.assessedAt === v.assessed_at_unix);
   const hash = match?.hash ?? txHash;
   const votes = match ? describeVotes(match.tally) : "";
@@ -464,10 +477,9 @@ async function runAssessment(chainId) {
     });
 
     say(`Transaction ${hash} submitted. Waiting for consensus — this can take a few minutes…`);
-    // waitForDecision, not waitForFinalization: the verdict is stored once the
-    // decision lands; finalization also waits for fee settlement.
-    // Five minutes, not the SDK's 30s default — five validators each make up
-    // to four fetches and an LLM call.
+    // Decision, not finalization: the verdict is stored once the decision
+    // lands. Five minutes, not the SDK's 30s default — each of five validators
+    // makes up to four fetches and an LLM call.
     const receipt = await client.waitForDecision({
       hash, interval: 3_000, retries: 100,
     });
@@ -479,7 +491,7 @@ async function runAssessment(chainId) {
       );
     }
     say(`Consensus reached. Transaction ${hash}`);
-    await refreshAssessments();
+    await refreshAssessments(hash);
     await readVerdict(chainId, hash);
   } catch (error) {
     // An unfunded account and the 60s throttle are both expected; name them.
