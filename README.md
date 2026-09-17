@@ -381,6 +381,6 @@ Two lessons came from reading live verdicts rather than from tests:
 - Live dashboard: https://aplombird-x.github.io/rollup-watchdog/
 - Contract on Studio Next:
   https://explorer-studio-dev.genlayer.com/address/0x9bB01d8B136527698f6196a28aD657e8800E22B7
-- Demo video: ← add
-- Agent Tank submission: ← add
+- Demo video: https://www.youtube.com/watch?v=RcJUWtE-5rQ
+- Agent Tank submission: `49ed66b3-f87b-4fad-ade3-e36e6fbb141b`
 - Built for the GenLayer Agent Tank hackathon, Sep 2026.
